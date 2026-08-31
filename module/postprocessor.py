@@ -2,6 +2,8 @@
 # Reads `all_texts` (list of page strings), applies imposter cleanup + mark reordering,
 # then writes to TXT/DOCX/PDF. Place this block after the Zawgyi detection/conversion
 # and before the output-writing section of your PDF-to-text script.
+import re
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1.  Myanmar Unicode mark-priority map  (ported from JS Priority)
@@ -23,7 +25,12 @@ _PRIORITY = {
     '\u103A': 14,  # asat
     '\u1037': 15,  # dot below
     '\u1038': 16,  # visarga
-   'u\1039' : 17,
+    # NOTE: \u1039 (stacker) is intentionally NOT a reorderable mark. Per the
+    # design: it belongs to the base cluster, resets the mark-run state, and the
+    # base after it starts a fresh ordering. Sequences like kinzi
+    # '\u1004\u103A\u1039' (asat BEFORE stacker) are canonical and pass through
+    # untouched. (The original literal 'u\1039' was an octal escape that never
+    # matched anything, so the pass-through behavior was already in effect.)
 }
 
 # Myanmar consonant range + independent vowels
@@ -112,13 +119,20 @@ _IMPOSTER_REPS = sorted([
     ('\u107D', '\u103B'),       # ya pin (asat context)
 ], key=lambda pair: len(pair[0]), reverse=True)
 
+# Single-pass compiled alternation (longest-first, as _IMPOSTER_REPS is sorted).
+_IMPOSTER_MAP = dict(_IMPOSTER_REPS)
+_IMPOSTER_RE = re.compile("|".join(re.escape(frm) for frm, _ in _IMPOSTER_REPS))
+
 
 def clean_imposters(t: str) -> str:
-    """Replace any lingering Zawgyi imposter codepoints with correct Unicode."""
-    tmp = t
-    for frm, to in _IMPOSTER_REPS:
-        tmp = tmp.replace(frm, to)
-    return tmp
+    """Replace any lingering Zawgyi imposter codepoints with correct Unicode.
+
+    One compiled-regex pass (the old version ran ~50 str.replace() scans over
+    the whole text, three times per page: page text + every line + every run).
+    """
+    if not t:
+        return t
+    return _IMPOSTER_RE.sub(lambda m: _IMPOSTER_MAP[m.group(0)], t)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

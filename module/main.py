@@ -16,6 +16,9 @@ from .unicoding import Rabbit
 from .postprocessor import postprocess, clean_imposters, reorder_marks
 from .formatter import write_output
 
+# How many leading pages pdfminer scans for page size / font names.
+_META_SCAN_PAGES = 20
+
 
 class ExtractorResult:
     """Holds the full pipeline result for inspection or API responses."""
@@ -72,13 +75,17 @@ def run_pipeline(pdf_bytes: bytes, out_path: str, pdf_name: str = "",
     -------
     ExtractorResult
     """
-    # 0. Extract metadata with pdfminer (fail-soft — parser does not need it)
+    # 0. Extract metadata with pdfminer (fail-soft — parser does not need it).
+    #    Capped scan: page size + font names come from the first pages; the
+    #    custom parser resolves everything else per page from raw objects.
+    #    A full walk of a 14k-page tree costs minutes of pdfminer resolution.
     script_dir = Path(__file__).resolve().parent
     meta_out_dir = script_dir.parent / "output"
     meta_out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        metadata = extract_pdf_metadata(pdf_bytes, out_dir=meta_out_dir)
+        metadata = extract_pdf_metadata(
+            pdf_bytes, out_dir=meta_out_dir, max_pages=_META_SCAN_PAGES)
     except Exception as e:
         print(f"[!] Metadata extraction failed ({e}); continuing without it")
         metadata = {}

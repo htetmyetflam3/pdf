@@ -200,6 +200,157 @@ def _lookup_font_family(font_ref: str, metadata: dict | None) -> str:
     return font_ref
 
 
+# ── Raw-object resolution (no pdfminer needed) ──────────────────────────────
+# Page dicts are tiny, so scanning them with regexes is cheap. This lets the
+# parser resolve /Resources → /Font → /BaseFont and /MediaBox per page directly
+# from `objects`, instead of needing a pdfminer walk over the whole page tree.
+
+_NAME_RE = re.compile(rb"/([A-Za-z0-9_+.\-]+)")
+_NUM_RE = re.compile(rb"-?\d+(?:\.\d+)?")
+
+
+def _resolve_indirect(objects: dict, d: bytes, key: bytes) -> bytes | None:
+    """Resolve /Key to an object body, following one level of indirection."""
+    if not d:
+        return None
+    m = re.search(rb"/" + key + rb"\b", d)
+    if not m:
+        return None
+    after = d[m.end():m.end() + 64]
+    ref = re.match(rb"\s+(\d+)\s+(\d+)\s+R", after)
+    if ref:
+        return objects.get((int(ref.group(1)), int(ref.group(2))))
+    dd = re.match(rb"\s*<<", after)
+    if dd:
+        start = m.end() + dd.end()
+        depth = 0
+        i = start - 2
+        while i < len(d) - 1:
+            if d[i:i+2] == b"<<":
+                depth += 1
+                i += 2
+            elif d[i:i+2] == b">>":
+                depth -= 1
+                i += 2
+                if depth == 0:
+                    return d[start-2:i]
+            else:
+                i += 1
+        return d[start-2:]
+    return None
+
+
+def resolve_page_fonts(objects: dict, page_num: int, page_gen: int) -> dict:
+    """Build a font_map for one page straight from raw objects.
+
+    Returns {"font_map": {...}, "mediabox": [x0,y0,x1,y1] | None}.
+    """
+    out = {"font_map": {}, "mediabox": None}
+    pd = objects.get((page_num, page_gen))
+    if not pd:
+        return out
+
+    resources = _resolve_indirect(objects, pd, b"Resources") or b""
+    fonts = _resolve_indirect(objects, resources, b"Font") if resources else None
+    if not fonts:
+        return out
+
+    # Iterate font entries: /F1 12 0 R  or  /F1 << ... >>
+    for m in _NAME_RE.finditer(fonts):
+        name = m.group(1).decode("latin-1")
+        after = fonts[m.end():m.end() + 96]
+        ref = re.match(rb"\s+(\d+)\s+(\d+)\s+R", after)
+        fobj = None
+        if ref:
+            fobj = objects.get((int(ref.group(1)), int(ref.group(2))))
+        elif after.lstrip()[:2] == b"<<":
+            start = m.end() + len(after) - len(after.lstrip())
+            depth, i = 0, start
+            while i < len(fonts) - 1:
+                if fonts[i:i+2] == b"<<":
+                    depth += 1; i += 2
+                elif fonts[i:i+2] == b">>":
+                    depth -= 1; i += 2
+                    if depth == 0:
+                        fobj = fonts[start:i]
+                        break
+                else:
+                    i += 1
+        if not fobj:
+            continue
+        base = re.search(rb"/BaseFont\s*/([^\s/<>\[\]()]+)", fobj)
+        sub = re.search(rb"/Subtype\s*/([A-Za-z0-9]+)", fobj)
+        enc = re.search(rb"/Encoding\s*(?:/([A-Za-z0-9\-]+)|(\d+)\s+\d+\s+R)", fobj)
+        full_name = base.group(1).decode("latin-1") if base else name
+        family = full_name.split("+")[-1]
+        entry = {
+            "family": family,
+            "full_name": full_name,
+            "size": 12,
+            "subtype": sub.group(1).decode("latin-1") if sub else "Unknown",
+            "encoding": (enc.group(1) or b"Custom").decode("latin-1") if enc else "Unknown",
+        }
+        keys = {name, "/" + name, family, full_name}
+        for k in keys:
+            if k:
+                out["font_map"][k] = entry
+    return out
+
+
+def parse_mediabox(objects: dict, page_num: int, page_gen: int) -> list[float] | None:
+    """MediaBox of a page: from the page dict, walking /Parent if needed."""
+    n, g = page_num, page_gen
+    for _ in range(8):  # max tree depth guard
+        d = objects.get((n, g))
+        if not d:
+            return None
+        mb = re.search(rb"/MediaBox\s*\[([^\]]+)\]", d)
+        if mb:
+            vals = [float(x) for x in _NUM_RE.findall(mb.group(1))][:4]
+            if len(vals) == 4:
+                return vals
+        par = re.search(rb"/Parent\s+(\d+)\s+(\d+)\s+R", d)
+        if not par:
+            return None
+        n, g = int(par.group(1)), int(par.group(2))
+    return None
+
+
+# Myanmar cluster guards for gap detection. PDF producers split a visual line
+# into several positioned runs — sometimes INSIDE a syllable (the Zawgyi
+# e-vowel \u1031 is drawn left of its consonant, marks/medials stack around
+# the base). A space inserted mid-cluster permanently breaks Zawgyi→Unicode
+# conversion (the ေ-move rule can't match across the space), so only insert
+# one when both sides can legally start/end a syllable.
+_MYA_SAFE_START = frozenset(
+    # consonants + independent vowels + digits + section signs
+    "\u1000\u1001\u1002\u1003\u1004\u1005\u1006\u1007\u1008\u1009"
+    "\u100A\u100B\u100C\u100D\u100E\u100F\u1010\u1011\u1012\u1013"
+    "\u1014\u1015\u1016\u1017\u1018\u1019\u101A\u101B\u101C\u101D"
+    "\u101E\u101F\u1020\u1021"
+    "\u1023\u1024\u1025\u1026\u1027\u1028\u1029\u102A"
+    "\u1040\u1041\u1042\u1043\u1044\u1045\u1046\u1047\u1048\u1049"
+    "\u104A\u104B\u104C\u104D\u104E\u104F"
+    "\u1050\u1051\u1052\u1053\u1054\u1055"
+)
+# chars that always expect a continuation (never end a word)
+_MYA_NO_END = frozenset("\u1031\u1039\u103B\u103C\u103D\u103E")
+
+
+def _word_gap(prev_text: str, next_text: str) -> bool:
+    """True if a space may be inserted between two runs without ever
+    splitting a Myanmar syllable cluster."""
+    if not prev_text or not next_text:
+        return False
+    p, n = prev_text[-1], next_text[0]
+    in_mya = ("\u1000" <= p <= "\u109F") or ("\u1000" <= n <= "\u109F")
+    if not in_mya:
+        return True          # latin/digits: plain word boundary
+    if p in _MYA_NO_END:     # e-vowel / medials / stacker await their base
+        return False
+    return n in _MYA_SAFE_START
+
+
 def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to_uni: dict, metadata: dict = None) -> dict:
     pd = objects.get((page_num, page_gen), b'')
     pd_str = pd.decode('latin-1', errors='replace')
@@ -343,7 +494,18 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
         merged = []
         for x, text, size, font in line_pieces:
             if merged and merged[-1]["font"] == font and merged[-1]["size"] == size:
-                merged[-1]["text"] += text
+                # Gap detection: a PDF line is often split into several text
+                # operators at different x. Without this the words jam together.
+                prev = merged[-1]
+                prev_size = prev["size"] or size or 12
+                prev_end = prev["x"] + len(prev["text"]) * prev_size * 0.5
+                gap = x - prev_end
+                if (gap > 0.3 * prev_size
+                        and prev["text"] and not prev["text"][-1].isspace()
+                        and text and not text[0].isspace()
+                        and _word_gap(prev["text"], text)):
+                    prev["text"] += "\t" if gap >= 3 * prev_size else " "
+                prev["text"] += text
             else:
                 merged.append({"x": x, "text": text, "size": size, "font": font})
         lines_out.append({
@@ -414,11 +576,20 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
     md_pages = (metadata or {}).get("pages") or []
     raw_texts = []
     page_layouts = []
+    doc_mediabox = None
     for idx, (pnum, pgen) in enumerate(all_pages):
+        # Per-page fonts straight from raw objects (fast, exact per page).
+        raw_fonts = resolve_page_fonts(objects, pnum, pgen)
+        if doc_mediabox is None:
+            doc_mediabox = parse_mediabox(objects, pnum, pgen)
         page_md = md_pages[idx] if idx < len(md_pages) else None
         local_meta = metadata
-        if page_md and metadata is not None:
-            # Prefer this page's /F1→family mapping over the document-wide last-write.
+        if raw_fonts["font_map"] and metadata is not None:
+            local_meta = dict(metadata)
+            local_meta["font_map"] = raw_fonts["font_map"]
+        elif page_md and metadata is not None:
+            # Fallback: prefer this page's /F1→family mapping over the
+            # document-wide last-write.
             local_map = dict(metadata.get("font_map") or {})
             for f in page_md.get("fonts") or []:
                 ref = str(f.get("ref") or "").lstrip("/")
@@ -443,12 +614,22 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
             "page_num": idx + 1,
             "lines": lines,
         }
+        mb = raw_fonts.get("mediabox") or (page_md or {}).get("mediabox")
+        if mb:
+            layout["mediabox"] = mb
         if page_md:
-            layout["mediabox"] = page_md.get("mediabox")
             layout["fonts"] = page_md.get("fonts")
         page_layouts.append(layout)
         if on_progress:
             on_progress({"done": idx + 1, "total": total})
+
+    page_size = None
+    if doc_mediabox:
+        page_size = {
+            "width": doc_mediabox[2] - doc_mediabox[0],
+            "height": doc_mediabox[3] - doc_mediabox[1],
+            "unit": "pt",
+        }
 
     return {
         "metadata": meta,
@@ -456,4 +637,5 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
         "pageCount": total,
         "totalCharacters": sum(len(t) for t in raw_texts),
         "page_layouts": page_layouts,
+        "page_size": page_size,
     }

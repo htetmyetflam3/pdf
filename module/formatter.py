@@ -94,7 +94,12 @@ def write_docx(all_texts, out_path, pdf_path, metadata, page_metadata=None):
                     f"</w:rPr>")
 
         def run(text, font_name, size_pt=12):
-            return f'<w:r>{font_rpr(font_name, size_pt)}<w:t xml:space="preserve">{_esc(text)}</w:t></w:r>'
+            # Literal \t (inserted by the parser at big column gaps) becomes a
+            # real Word tab; everything else stays one xml:space=preserve run.
+            parts = [_esc(p) for p in (text or "").split("\t")]
+            inner = "<w:tab/>".join(
+                f'<w:t xml:space="preserve">{p}</w:t>' for p in parts)
+            return f"<w:r>{font_rpr(font_name, size_pt)}{inner}</w:r>"
 
         body = []
         body.append(f'<w:p><w:pPr><w:pStyle w:val="Title"/></w:pPr>'
@@ -104,8 +109,34 @@ def write_docx(all_texts, out_path, pdf_path, metadata, page_metadata=None):
         for k, v in _flat_meta_items(metadata or {}):
             body.append(f"<w:p>{run(f'{k}: {v}', _EN_FONT, 11)}</w:p>")
 
+        # ── Layout geometry ────────────────────────────────────────────────
+        # The parser records each line's x/y/size. Word positions text as
+        # margin + paragraph indent, so: put the left margin at the document's
+        # typical left text edge (10th percentile of line starts, ignoring
+        # outliers) and indent paragraphs that start further right. Blank
+        # vertical space between lines becomes sized spacer paragraphs.
+        left_x = 72.0
+        if page_metadata:
+            xs = []
+            for pg in page_metadata:
+                for ln in (pg or {}).get("lines") or []:
+                    if ln.get("x") is not None:
+                        xs.append(ln["x"])
+            if xs:
+                xs.sort()
+                left_x = xs[len(xs) // 10]
+        margin_left = max(360, int(round(left_x * 20)))  # twips, min 0.25"
+
+        def indent_twips(x):
+            try:
+                return max(0, int(round((float(x) - left_x) * 20)))
+            except (TypeError, ValueError):
+                return 0
+
         for idx, txt in enumerate(all_texts):
-            body.append(f'<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+            body.append(f'<w:p><w:pPr><w:pStyle w:val="Heading1"/>'
+                        f'<w:spacing w:before="240" w:after="120"/></w:pPr>'
+                        f'<w:r><w:br w:type="page"/></w:r>'
                         f'{run(f"Page {idx+1}", _EN_FONT, 14)}</w:p>')
 
             page_meta = None
@@ -114,21 +145,35 @@ def write_docx(all_texts, out_path, pdf_path, metadata, page_metadata=None):
 
             lines = (page_meta or {}).get("lines") if page_meta else None
             if lines:
+                prev_y = None
                 for line in lines:
+                    y = line.get("y")
+                    size = line.get("size") or 12
+                    # Approximate skipped blank lines (baseline gap >> line height).
+                    if prev_y is not None and y is not None:
+                        gap = prev_y - y  # y grows upward in PDF space
+                        line_h = 1.25 * max(size, 6)
+                        blank = int(gap / line_h) - 1
+                        for _ in range(max(0, min(blank, 30))):
+                            body.append(f'<w:p>{run("", _EN_FONT, size)}</w:p>')
+                    prev_y = y
+
                     runs = line.get("runs") or [{
                         "text": line.get("text", ""),
                         "font": line.get("font"),
-                        "size": line.get("size", 12),
+                        "size": size,
                     }]
                     parts = []
                     for r in runs:
                         t = r.get("text") or ""
-                        size = r.get("size") or line.get("size") or 12
+                        rsize = r.get("size") or size
                         font = word_font_for(r.get("font") or line.get("font"), t, metadata)
-                        parts.append(run(t, font, size))
+                        parts.append(run(t, font, rsize))
                     if not parts:
                         parts.append(run("", _EN_FONT, 12))
-                    body.append(f'<w:p>{"".join(parts)}</w:p>')
+                    ind = indent_twips(line.get("x"))
+                    ind_xml = f'<w:ind w:left="{ind}"/>' if ind else ""
+                    body.append(f'<w:p><w:pPr>{ind_xml}</w:pPr>{"".join(parts)}</w:p>')
             else:
                 for line in (txt or "").split("\n"):
                     font = word_font_for(None, line, metadata)
@@ -138,7 +183,7 @@ def write_docx(all_texts, out_path, pdf_path, metadata, page_metadata=None):
                f'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
                f'<w:body>{"".join(body)}'
                f'<w:sectPr><w:pgSz w:w="{pg_w}" w:h="{pg_h}"/>'
-               f'<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>'
+               f'<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="{margin_left}"/></w:sectPr>'
                f"</w:body></w:document>")
         zf.writestr("word/document.xml", doc)
     print(f"[+] Saved DOCX: {out_path}")
