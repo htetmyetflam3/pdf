@@ -1,28 +1,195 @@
 """
 Description: PDF metadata extractor using pdfminer.six.
 Reads: PDF bytes.
-Processes: Extracts page tree, MediaBox, fonts, images, text layout with positions.
+Processes: Page tree, MediaBox, fonts (resolving indirect objects), images.
 Outputs: Metadata dict passed to parser and writer.
 Writes: JSON metadata file to ../output/ for inspection.
+
+Note: pdfminer layout text is not used for extraction — Zawgyi/CID fonts
+need the custom parser in prase.py. This module only supplies structure
+(page size, font map, images) so parsing and DOCX output can stay font-aware.
 """
 
-import json
-import os
-from pathlib import Path
-from typing import BinaryIO
+from __future__ import annotations
 
-from pdfminer.high_level import extract_text
+import json
+import re
+from io import BytesIO
+from pathlib import Path
+
 from pdfminer.pdfparser import PDFParser
 from pdfminer.pdfdocument import PDFDocument
 from pdfminer.pdfpage import PDFPage
-from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
-from pdfminer.layout import LAParams
-from pdfminer.converter import PDFPageAggregator
+from pdfminer.pdftypes import PDFObjRef, PDFStream, resolve1
+from pdfminer.psparser import PSLiteral
+
+
+def _unescape_pdf_name(name: str) -> str:
+    """Decode PDF name hex escapes (Times#20New#20Roman → Times New Roman)."""
+    return re.sub(r"#([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), name or "")
+
+
+def _decode_pdf_text(value) -> str:
+    """Decode Info-dict strings, including UTF-16BE with BOM (þÿ...)."""
+    if isinstance(value, bytes):
+        if value.startswith((b"\xfe\xff", b"\xff\xfe")):
+            try:
+                return value.decode("utf-16").strip("\ufeff")
+            except Exception:
+                pass
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            value = value.decode("latin-1", "replace")
+    text = value if isinstance(value, str) else str(value)
+    if text.startswith("þÿ"):
+        try:
+            return text.encode("latin-1").decode("utf-16-be").strip("\ufeff")
+        except Exception:
+            return text
+    if text.startswith("\ufeff"):
+        return text.lstrip("\ufeff")
+    return text
+
+
+def _ps_name(obj) -> str:
+    """Best-effort string from a pdfminer name / literal / bytes / ref."""
+    try:
+        obj = resolve1(obj)
+    except Exception:
+        pass
+    if obj is None:
+        return "Unknown"
+    if isinstance(obj, PSLiteral):
+        return _unescape_pdf_name(obj.name)
+    if isinstance(obj, bytes):
+        return _unescape_pdf_name(obj.decode("latin-1", "replace"))
+    return _unescape_pdf_name(str(obj).lstrip("/"))
+
+
+def _as_dict(obj) -> dict:
+    """Resolve indirect objects until we have a dict (or {})."""
+    try:
+        obj = resolve1(obj)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _as_list(obj) -> list:
+    try:
+        obj = resolve1(obj)
+    except Exception:
+        return []
+    if obj is None:
+        return []
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+    return []
+
+
+def _to_jsonable(obj, depth: int = 0):
+    """Coerce pdfminer objects into JSON-serializable Python types."""
+    if depth > 16:
+        return str(obj)
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8")
+        except Exception:
+            return obj.decode("latin-1", "replace")
+    if isinstance(obj, PSLiteral):
+        return obj.name
+    if isinstance(obj, PDFObjRef):
+        try:
+            return _to_jsonable(resolve1(obj), depth + 1)
+        except Exception:
+            return f"R:{getattr(obj, 'objid', '?')}"
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[str(_to_jsonable(k, depth + 1))] = _to_jsonable(v, depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(x, depth + 1) for x in obj]
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+
+def _encoding_name(enc) -> str:
+    enc = resolve1(enc) if enc is not None else None
+    if enc is None:
+        return "Unknown"
+    if isinstance(enc, dict):
+        return _ps_name(enc.get("BaseEncoding", "Custom"))
+    return _ps_name(enc)
+
+
+def _mediabox_list(mb) -> list[float]:
+    vals = _as_list(mb)
+    if len(vals) >= 4:
+        try:
+            return [float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])]
+        except Exception:
+            pass
+    return [0.0, 0.0, 612.0, 792.0]
+
+
+def _register_font(font_map: dict, ref_name: str, font: dict) -> dict:
+    """Build a page-font record and index it in font_map under several keys."""
+    full_name = _ps_name(font.get("BaseFont", "Unknown"))
+    family = full_name.split("+")[-1] if full_name else "Unknown"
+    subtype = _ps_name(font.get("Subtype", "Unknown"))
+    encoding = _encoding_name(font.get("Encoding"))
+    entry = {
+        "family": family,
+        "full_name": full_name,
+        "size": 12,
+        "subtype": subtype,
+        "encoding": encoding,
+    }
+    keys = {ref_name, ref_name.lstrip("/"), family, full_name}
+    if not ref_name.startswith("/"):
+        keys.add("/" + ref_name)
+    for key in keys:
+        if key:
+            font_map[str(key)] = entry
+    return {
+        "ref": ref_name.lstrip("/"),
+        "name": full_name,
+        "subtype": subtype,
+        "encoding": encoding,
+        "family": family,
+    }
+
+
+def _page_images(resources: dict) -> list[dict]:
+    images = []
+    xobjects = _as_dict(resources.get("XObject"))
+    for name, ref in xobjects.items():
+        try:
+            xobj = resolve1(ref)
+            getter = xobj.get if isinstance(xobj, (dict, PDFStream)) else None
+            if getter is None:
+                continue
+            if _ps_name(getter("Subtype")) != "Image":
+                continue
+            images.append({
+                "name": _ps_name(name),
+                "width": float(getter("Width") or 0),
+                "height": float(getter("Height") or 0),
+            })
+        except Exception:
+            continue
+    return images
 
 
 def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) -> dict:
     """
-    Extract full metadata from PDF using pdfminer.
+    Extract structural metadata from PDF using pdfminer.
 
     Parameters
     ----------
@@ -41,157 +208,132 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
                 {
                     "page_num": int,
                     "mediabox": [x0, y0, x1, y1],
-                    "fonts": [{"name": str, "subtype": str, "encoding": str}],
-                    "images": [{"x": float, "y": float, "width": float, "height": float}],
-                    "text_blocks": [
-                        {"x": float, "y": float, "text": str, "font": str, "size": float}
-                    ]
+                    "fonts": [{"ref", "name", "subtype", "encoding", "family"}],
+                    "images": [{"name", "width", "height"}]
                 }
             ],
             "info": {title, author, creator, producer, ...},
-            "font_map": {"PDF+FontName": {"family": str, "size": float}}
+            "font_map": {"F1": {"family": str, "full_name": str, "size": float, ...}}
         }
     """
-    from io import BytesIO
+    empty = {
+        "page_count": 0,
+        "page_size": {"width": 595.0, "height": 842.0, "unit": "pt"},
+        "pages": [],
+        "info": {},
+        "font_map": {},
+    }
 
-    stream = BytesIO(pdf_bytes)
-    parser = PDFParser(stream)
-    doc = PDFDocument(parser)
+    try:
+        stream = BytesIO(pdf_bytes)
+        parser = PDFParser(stream)
+        doc = PDFDocument(parser)
+    except Exception as e:
+        empty["error"] = str(e)
+        _write_metadata_json(empty, out_dir)
+        print(f"[!] Metadata parse failed: {e}")
+        return empty
 
-    # Document info
     info = {}
-    if doc.info:
-        for k, v in doc.info[0].items():
-            try:
-                info[k] = str(v.resolve()) if hasattr(v, 'resolve') else str(v)
-            except Exception:
-                info[k] = str(v)
-
-    rsrcmgr = PDFResourceManager()
-    laparams = LAParams(
-        line_overlap=0.5,
-        char_margin=2.0,
-        line_margin=0.5,
-        word_margin=0.1,
-        boxes_flow=0.5,
-        detect_vertical=False,
-        all_texts=True,
-    )
-    device = PDFPageAggregator(rsrcmgr, laparams=laparams)
+    try:
+        if doc.info:
+            for k, v in doc.info[0].items():
+                try:
+                    info[_ps_name(k)] = _decode_pdf_text(_to_jsonable(v))
+                except Exception:
+                    info[str(k)] = str(v)
+    except Exception:
+        pass
 
     pages_data = []
-    font_map = {}
+    font_map: dict = {}
+    font_obj_cache: dict = {}
+    mediabox = [0.0, 0.0, 612.0, 792.0]
 
-    for page_num, page in enumerate(PDFPage.create_pages(doc), 1):
-        interpreter = PDFPageInterpreter(rsrcmgr, device)
-        interpreter.process_page(page)
+    try:
+        for page_num, page in enumerate(PDFPage.create_pages(doc), 1):
+            try:
+                mediabox = _mediabox_list(getattr(page, "mediabox", None))
+                resources = getattr(page, "resources", None)
+                if isinstance(resources, PDFObjRef):
+                    resources = resolve1(resources)
+                resources = resources if isinstance(resources, dict) else {}
 
-        layout = device.get_result()
-        mediabox = page.mediabox  # [x0, y0, x1, y1]
-
-        # Extract fonts from resource manager
-        page_fonts = []
-        if hasattr(page, 'resources') and page.resources:
-            fonts = page.resources.get('Font', {})
-            for font_ref, font_obj in fonts.items():
-                try:
-                    font = font_obj.resolve() if hasattr(font_obj, 'resolve') else font_obj
-                    name = font.get('BaseFont', 'Unknown')
-                    subtype = font.get('Subtype', 'Unknown')
-                    encoding = font.get('Encoding', 'Unknown')
-                    page_fonts.append({
-                        "ref": font_ref,
-                        "name": str(name),
-                        "subtype": str(subtype),
-                        "encoding": str(encoding)
-                    })
-                    # Build font map for writer
-                    font_map[str(font_ref)] = {
-                        "family": str(name).split('+')[-1],  # strip subset prefix
-                        "full_name": str(name),
-                        "size": 12  # default, updated per block
-                    }
-                except Exception:
-                    pass
-
-        # Extract text blocks with positions and fonts
-        text_blocks = []
-        images = []
-
-        for obj in layout._objs:
-            if hasattr(obj, 'get_text'):
-                # LTTextBox, LTTextLine, etc.
-                text = obj.get_text().strip()
-                if text:
-                    font_name = "Unknown"
-                    font_size = 12
+                page_fonts = []
+                fonts = resources.get("Font", {})
+                # The actual bug: /Font is often an indirect object, not a dict.
+                fonts = _as_dict(fonts)
+                for font_ref, font_obj in fonts.items():
                     try:
-                        # Get font from first character
-                        for line in obj:
-                            for char in line:
-                                if hasattr(char, 'fontname'):
-                                    font_name = char.fontname
-                                    font_size = char.size
-                                    break
-                            break
+                        cache_key = None
+                        if isinstance(font_obj, PDFObjRef):
+                            cache_key = (font_obj.objid, getattr(font_obj, "genno", 0))
+                            font = font_obj_cache.get(cache_key)
+                            if font is None:
+                                font = _as_dict(font_obj)
+                                font_obj_cache[cache_key] = font
+                        else:
+                            font = _as_dict(font_obj)
+                        if not font:
+                            continue
+                        page_fonts.append(_register_font(font_map, _ps_name(font_ref), font))
                     except Exception:
-                        pass
+                        continue
 
-                    text_blocks.append({
-                        "x": obj.x0,
-                        "y": obj.y0,
-                        "width": obj.width,
-                        "height": obj.height,
-                        "text": text,
-                        "font": font_name,
-                        "size": font_size
-                    })
-
-                    # Update font map with actual size
-                    clean_font = font_name.split('+')[-1] if '+' in font_name else font_name
-                    if font_name in font_map:
-                        font_map[font_name]["size"] = font_size
-                        font_map[font_name]["family"] = clean_font
-
-            elif hasattr(obj, 'stream'):
-                # LTImage
-                images.append({
-                    "x": obj.x0,
-                    "y": obj.y0,
-                    "width": obj.width,
-                    "height": obj.height,
-                    "name": getattr(obj, 'name', 'unknown')
+                pages_data.append({
+                    "page_num": page_num,
+                    "mediabox": mediabox,
+                    "fonts": page_fonts,
+                    "images": _page_images(resources),
                 })
+            except Exception:
+                pages_data.append({
+                    "page_num": page_num,
+                    "mediabox": mediabox,
+                    "fonts": [],
+                    "images": [],
+                })
+    except Exception as e:
+        empty["error"] = str(e)
+        empty["info"] = info
+        empty["font_map"] = font_map
+        empty["pages"] = pages_data
+        empty["page_count"] = len(pages_data)
+        _write_metadata_json(empty, out_dir)
+        print(f"[!] Metadata page walk failed: {e}")
+        return empty
 
-        pages_data.append({
-            "page_num": page_num,
-            "mediabox": mediabox,
-            "fonts": page_fonts,
-            "images": images,
-            "text_blocks": text_blocks
-        })
+    width = float(mediabox[2] - mediabox[0]) if mediabox else 595.0
+    height = float(mediabox[3] - mediabox[1]) if mediabox else 842.0
 
     metadata = {
         "page_count": len(pages_data),
         "page_size": {
-            "width": float(mediabox[2]) if pages_data else 595,
-            "height": float(mediabox[3]) if pages_data else 842,
-            "unit": "pt"
+            "width": width if width > 0 else 595.0,
+            "height": height if height > 0 else 842.0,
+            "unit": "pt",
         },
         "pages": pages_data,
         "info": info,
-        "font_map": font_map
+        "font_map": font_map,
     }
 
-    # Write to file if out_dir given
-    if out_dir:
+    _write_metadata_json(metadata, out_dir)
+    return metadata
+
+
+def _write_metadata_json(metadata: dict, out_dir: str | Path | None) -> None:
+    if not out_dir:
+        return
+    try:
         out_path = Path(out_dir) / "metadata.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _to_jsonable(metadata)
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(metadata, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
         print(f"[+] Metadata saved: {out_path}")
-
-    return metadata
+    except Exception as e:
+        print(f"[!] Could not write metadata.json: {e}")
 
 
 def load_metadata(out_dir: str | Path) -> dict:
@@ -203,32 +345,43 @@ def load_metadata(out_dir: str | Path) -> dict:
         return json.load(f)
 
 
-def get_page_size(metadata: dict) -> tuple[float, float]:
+def get_page_size(metadata: dict | None) -> tuple[float, float]:
     """Return (width, height) in points."""
-    ps = metadata.get("page_size", {})
-    return ps.get("width", 595), ps.get("height", 842)
+    if not metadata:
+        return 595.0, 842.0
+    ps = metadata.get("page_size") or {}
+    return float(ps.get("width", 595) or 595), float(ps.get("height", 842) or 842)
 
 
-def map_font_to_ttf(font_name: str, metadata: dict) -> str | None:
+def map_font_to_ttf(font_name: str, metadata: dict | None) -> str | None:
     """
-    Map a pdfminer font name to your TTF file path.
+    Map a pdfminer / parser font name to a TTF file path under fonts/.
     Returns None if no mapping found.
     """
-    font_map = metadata.get("font_map", {})
-    fm = font_map.get(font_name, {})
-    family = fm.get("family", font_name)
+    font_map = (metadata or {}).get("font_map") or {}
+    fm = font_map.get(font_name, {}) if font_name else {}
+    family = fm.get("family") or font_name or ""
 
-    # Your font mappings
     mappings = {
         "Amyanmar": "Unicode/YoeYar-One_Bold.ttf",
         "Arlarwade": "Unicode/Arlarwade.ttf",
         "Gautami": "Unicode/Gautami.ttf",
-        "Times": "AnonymousPro/AnonymousPro-Regular.ttf",
+        "Zawgyi": "Unicode/YoeYar-One_Regular.ttf",
+        "YoeYar": "Unicode/YoeYar-One_Regular.ttf",
+        "Pyidaungsu": "Unicode/Pyidaungsu_Regular.ttf",
+        "Padauk": "Unicode/Padauk.ttf",
+        "Myanmar": "Unicode/MyanmarText_Regular.ttf",
         "Times-Bold": "AnonymousPro/AnonymousPro-Bold.ttf",
+        "Times New Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
         "Times-Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
+        "Times": "AnonymousPro/AnonymousPro-Regular.ttf",
+        "Anonymous": "AnonymousPro/AnonymousPro-Regular.ttf",
     }
 
-    for key, path in mappings.items():
-        if key.lower() in family.lower():
+    family_l = family.lower()
+    name_l = (font_name or "").lower()
+    for key, path in sorted(mappings.items(), key=lambda kv: -len(kv[0])):
+        kl = key.lower()
+        if kl in family_l or kl in name_l:
             return path
     return None

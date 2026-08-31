@@ -185,7 +185,22 @@ def find_root_pages(objects: dict) -> int | None:
     return None
 
 
-def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to_uni: dict) -> str:
+def _lookup_font_family(font_ref: str, metadata: dict | None) -> str:
+    """Resolve a content-stream font resource name (F1) to a family (Zawgyi-One)."""
+    if not font_ref:
+        return "Unknown"
+    font_map = (metadata or {}).get("font_map") or {}
+    candidates = [font_ref, font_ref.lstrip("/")]
+    if font_ref and not font_ref.startswith("/"):
+        candidates.append("/" + font_ref)
+    for key in candidates:
+        hit = font_map.get(key)
+        if hit:
+            return hit.get("family") or font_ref
+    return font_ref
+
+
+def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to_uni: dict, metadata: dict = None) -> dict:
     pd = objects.get((page_num, page_gen), b'')
     pd_str = pd.decode('latin-1', errors='replace')
     streams = []
@@ -198,18 +213,40 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
             streams = [int(x) for x in re.findall(r'(\d+)\s+\d+\s+R', ca.group(1))]
 
     pieces = []
+    current_font = "Unknown"
+    current_size = 12.0
+    tf_re = re.compile(r'/([A-Za-z0-9_+-]+)\s+([\d.]+)\s+Tf')
     for sn in streams:
         s = get_stream(objects, sn)
         if not s:
             continue
         content = s.decode('latin-1', errors='replace')
-        blocks = re.findall(r'BT\s+(.*?)\s+ET', content, re.DOTALL)
-        for block in blocks:
+        # Walk outside-BT operators and BT/ET blocks so /Tf before BT is not missed.
+        parts = re.split(r'(BT\s+.*?\s+ET)', content, flags=re.DOTALL)
+        for part in parts:
+            is_bt = part.lstrip().startswith('BT')
+            if not is_bt:
+                for tf in tf_re.finditer(part):
+                    current_font = _lookup_font_family(tf.group(1), metadata)
+                    current_size = float(tf.group(2))
+                continue
+            block_m = re.match(r'BT\s+(.*?)\s+ET', part, re.DOTALL)
+            block = block_m.group(1) if block_m else part
+            tf_match = None
+            for tf_match in tf_re.finditer(block):
+                pass
+            if tf_match:
+                current_font = _lookup_font_family(tf_match.group(1), metadata)
+                current_size = float(tf_match.group(2))
+            font_size = current_size
+            font_name = current_font
+
             tm_match = re.search(r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+Tm', block)
             if not tm_match:
                 continue
             x = float(tm_match.group(5))
             y = float(tm_match.group(6))
+
             block_texts = []
 
             for tj in re.finditer(r'\[(.*?)\]\s*TJ', block):
@@ -288,36 +325,73 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
                 block_texts.append(s_text)
 
             if block_texts:
-                pieces.append((y, x, ''.join(block_texts)))
+                pieces.append((y, x, ''.join(block_texts), font_size, font_name))
 
     if not pieces:
-        return ""
+        return {"text": "", "lines": []}
 
     pieces.sort(key=lambda p: (-p[0], p[1]))
-    lines = []
+    lines_out = []
     current_y = pieces[0][0]
-    current_line = []
-    for y, x, text in pieces:
-        if abs(y - current_y) > 3:
-            lines.append(''.join(t for _, t in sorted(current_line)))
+    current_size = pieces[0][3] or 12
+    current_line = []  # (x, text, size, font)
+
+    def _flush(line_pieces, y):
+        if not line_pieces:
+            return
+        line_pieces = sorted(line_pieces, key=lambda r: r[0])
+        merged = []
+        for x, text, size, font in line_pieces:
+            if merged and merged[-1]["font"] == font and merged[-1]["size"] == size:
+                merged[-1]["text"] += text
+            else:
+                merged.append({"x": x, "text": text, "size": size, "font": font})
+        lines_out.append({
+            "text": "".join(r["text"] for r in merged),
+            "x": line_pieces[0][0],
+            "y": y,
+            "size": merged[0]["size"] if merged else 12,
+            "font": merged[0]["font"] if merged else "Unknown",
+            "runs": merged,
+        })
+
+    for y, x, text, size, font in pieces:
+        y_tol = max(3.0, (size or current_size or 12) * 0.2)
+        if abs(y - current_y) > y_tol:
+            _flush(current_line, current_y)
             current_line = []
             current_y = y
-        current_line.append((x, text))
-    if current_line:
-        lines.append(''.join(t for _, t in sorted(current_line)))
-    return '\n'.join(lines)
+            current_size = size
+        current_line.append((x, text, size, font))
+    _flush(current_line, current_y)
+
+    return {
+        "text": "\n".join(ln["text"] for ln in lines_out),
+        "lines": lines_out,
+    }
 
 
-def extract_pdf(pdf_bytes: bytes, on_progress=None) -> dict:
+def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> dict:
     """
     Extract Burmese text from PDF bytes.
     Sequential extraction, memory-flat.
+    
+    Parameters
+    ----------
+    pdf_bytes : bytes
+        Raw PDF file bytes.
+    metadata : dict | None
+        Optional metadata from pdfminer to guide extraction.
+    on_progress : callable
+        Called with {"done": int, "total": int} per page.
     """
     raw = pdf_bytes
 
     objects = parse_pdf_objects(raw)
 
-    metadata = extract_metadata(objects)
+    meta = extract_metadata(objects)
+    if metadata:
+        meta.update(metadata.get("info", {}))
 
     ff2_ref = find_font_file2(objects)
     if not ff2_ref:
@@ -337,16 +411,49 @@ def extract_pdf(pdf_bytes: bytes, on_progress=None) -> dict:
     all_pages = collect_pages(objects, pages_obj)
     total = len(all_pages)
 
+    md_pages = (metadata or {}).get("pages") or []
     raw_texts = []
+    page_layouts = []
     for idx, (pnum, pgen) in enumerate(all_pages):
-        txt = extract_page_text_layout(objects, pnum, pgen, gid_to_uni)
+        page_md = md_pages[idx] if idx < len(md_pages) else None
+        local_meta = metadata
+        if page_md and metadata is not None:
+            # Prefer this page's /F1→family mapping over the document-wide last-write.
+            local_map = dict(metadata.get("font_map") or {})
+            for f in page_md.get("fonts") or []:
+                ref = str(f.get("ref") or "").lstrip("/")
+                if not ref:
+                    continue
+                entry = {
+                    "family": f.get("family") or ref,
+                    "full_name": f.get("name") or ref,
+                    "size": 12,
+                    "subtype": f.get("subtype"),
+                    "encoding": f.get("encoding"),
+                }
+                local_map[ref] = entry
+                local_map["/" + ref] = entry
+            local_meta = dict(metadata)
+            local_meta["font_map"] = local_map
+        extracted = extract_page_text_layout(objects, pnum, pgen, gid_to_uni, local_meta)
+        txt = extracted.get("text", "") if isinstance(extracted, dict) else (extracted or "")
+        lines = extracted.get("lines", []) if isinstance(extracted, dict) else []
         raw_texts.append(txt)
+        layout = {
+            "page_num": idx + 1,
+            "lines": lines,
+        }
+        if page_md:
+            layout["mediabox"] = page_md.get("mediabox")
+            layout["fonts"] = page_md.get("fonts")
+        page_layouts.append(layout)
         if on_progress:
             on_progress({"done": idx + 1, "total": total})
 
     return {
-        "metadata": metadata,
+        "metadata": meta,
         "pages": raw_texts,
         "pageCount": total,
         "totalCharacters": sum(len(t) for t in raw_texts),
+        "page_layouts": page_layouts,
     }
