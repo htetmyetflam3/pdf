@@ -159,6 +159,50 @@ def parse_ttf_cmap(data: bytes) -> dict:
     return mappings
 
 
+def parse_ttf_widths(data: bytes) -> tuple[dict, float]:
+    """Extract per-codepoint advance widths from a TTF (cmap + hmtx).
+
+    Returns ({unicode_char: advance_in_em_units}, units_per_em).
+    Zero-width (combining marks) and missing chars are simply absent/0.
+    """
+    if len(data) < 12:
+        return {}, 1000.0
+    num_tables = struct.unpack(">H", data[4:6])[0]
+    tbls = {}
+    off = 12
+    for _ in range(num_tables):
+        if off + 16 > len(data):
+            break
+        tag = data[off:off+4].decode("ascii", errors="replace")
+        tbls[tag] = struct.unpack(">I", data[off+8:off+12])[0]
+        off += 16
+    if "hmtx" not in tbls or "hhea" not in tbls or "maxp" not in tbls:
+        return {}, 1000.0
+    try:
+        upem = struct.unpack(">H", data[tbls["head"] + 18:tbls["head"] + 20])[0] or 1000.0
+        num_h = struct.unpack(">H", data[tbls["hhea"] + 34:tbls["hhea"] + 36])[0]
+        # gid -> advance (hmtx: numberOfHMetrics longs, then same-width runt)
+        gid_adv = []
+        p = tbls["hmtx"]
+        for i in range(num_h):
+            if p + 4 > len(data):
+                break
+            gid_adv.append(struct.unpack(">H", data[p:p+2])[0])
+            p += 4
+        # map through the cmap we already parse; key by CHARACTER for fast
+        # per-glyph lookup during layout (combining marks excluded: adv == 0)
+        uni_to_gid = parse_ttf_cmap(data)
+        adv = {}
+        for uni, gid in uni_to_gid.items():
+            if gid < len(gid_adv):
+                a = gid_adv[gid]
+                if a:
+                    adv[chr(uni)] = a / upem
+        return adv, upem
+    except Exception:
+        return {}, 1000.0
+
+
 def collect_pages(objects: dict, page_num: int, gen: int = 0) -> list:
     d = objects.get((page_num, gen), b'')
     d_str = d.decode('latin-1', errors='replace')
@@ -380,7 +424,7 @@ def _word_gap(prev_text: str, next_text: str) -> bool:
     return n in _MYA_SAFE_START
 
 
-def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to_uni: dict, metadata: dict = None) -> dict:
+def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to_uni: dict, metadata: dict = None, widths: dict = None) -> dict:
     pd = objects.get((page_num, page_gen), b'')
     pd_str = pd.decode('latin-1', errors='replace')
     streams = []
@@ -511,6 +555,17 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
         return {"text": "", "lines": []}
 
     pieces.sort(key=lambda p: (-p[0], p[1]))
+    # Advance-width table for exact run widths (falls back to ~0.53em/char).
+    adv = widths if widths else {}
+    adv_get = adv.get
+
+    def _run_width(text, size):
+        w = 0.0
+        for c in text:
+            a = adv_get(c)
+            w += a if a is not None else 0.53
+        return w * size
+
     lines_out = []
     current_y = pieces[0][0]
     current_size = pieces[0][3] or 12
@@ -527,22 +582,26 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
                 # operators at different x. Without this the words jam together.
                 prev = merged[-1]
                 prev_size = prev["size"] or size or 12
-                prev_end = prev["x"] + len(prev["text"]) * prev_size * 0.5
+                prev_end = prev["x"] + prev["w"]
                 gap = x - prev_end
                 if (gap > 0.3 * prev_size
                         and prev["text"] and not prev["text"][-1].isspace()
                         and text and not text[0].isspace()
                         and _word_gap(prev["text"], text)):
                     prev["text"] += "\t" if gap >= 3 * prev_size else " "
+                    prev["w"] += gap  # the inserted space spans the real gap
                 prev["text"] += text
+                prev["w"] += _run_width(text, prev_size)
             else:
-                merged.append({"x": x, "text": text, "size": size, "font": font})
+                merged.append({"x": x, "text": text, "size": size, "font": font,
+                               "w": _run_width(text, size)})
         lines_out.append({
             "text": "".join(r["text"] for r in merged),
             "x": line_pieces[0][0],
             "y": y,
             "size": merged[0]["size"] if merged else 12,
             "font": merged[0]["font"] if merged else "Unknown",
+            "right": max(r["x"] + r["w"] for r in merged),
             "runs": merged,
         })
 
@@ -594,6 +653,11 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
 
     cmap_uni_to_gid = parse_ttf_cmap(ttf)
     gid_to_uni = {gid: uni for uni, gid in cmap_uni_to_gid.items() if gid}
+    # Exact glyph advances (hmtx) — used for run widths / justification.
+    try:
+        uni_adv, _upem = parse_ttf_widths(ttf)
+    except Exception:
+        uni_adv = {}
 
     pages_obj = find_root_pages(objects)
     if not pages_obj:
@@ -640,7 +704,7 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
                 local_map["/" + ref] = entry
             local_meta = dict(metadata)
             local_meta["font_map"] = local_map
-        extracted = extract_page_text_layout(objects, pnum, pgen, gid_to_uni, local_meta)
+        extracted = extract_page_text_layout(objects, pnum, pgen, gid_to_uni, local_meta, uni_adv)
         txt = extracted.get("text", "") if isinstance(extracted, dict) else (extracted or "")
         lines = extracted.get("lines", []) if isinstance(extracted, dict) else []
         raw_texts.append(txt)
