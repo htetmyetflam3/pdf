@@ -184,8 +184,12 @@ if [ ! -f ".gitignore" ]; then
 *output*
 *.tree*
 /frontend/
-/module/__pycache__/
-*__pycache__/
+*/module/__pycache__/
+*module/__pycache__/
+*__pycache__
+__pycache__/
+*.py[cod]
+
 /raw_storage/
 /quaratine/
 /uploads/

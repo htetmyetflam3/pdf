@@ -15,7 +15,8 @@
 *.tree*
 /frontend/
 /raw_storage/
-/module/__pycache__/
+*/module/__pycache__/
+*module/__pycache__/
 *__pycache__/
 /quaratine/
 /uploads/
