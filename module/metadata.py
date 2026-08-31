@@ -187,7 +187,8 @@ def _page_images(resources: dict) -> list[dict]:
     return images
 
 
-def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) -> dict:
+def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None,
+                         max_pages: int | None = None) -> dict:
     """
     Extract structural metadata from PDF using pdfminer.
 
@@ -197,6 +198,13 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
         Raw PDF file bytes.
     out_dir : str | Path | None
         If given, write metadata JSON to this directory.
+    max_pages : int | None
+        Stop walking the page tree after this many pages. pdfminer's
+        PDFPage.create_pages() resolves the tree lazily per page, so a cap
+        genuinely skips work — on a 14k-page file a full walk costs minutes
+        while the first ~20 pages already determine page size + font names.
+        The custom parser in prase.py resolves everything else per page from
+        raw objects.
 
     Returns
     -------
@@ -204,16 +212,9 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
         {
             "page_count": int,
             "page_size": {"width": float, "height": float, "unit": "pt"},
-            "pages": [
-                {
-                    "page_num": int,
-                    "mediabox": [x0, y0, x1, y1],
-                    "fonts": [{"ref", "name", "subtype", "encoding", "family"}],
-                    "images": [{"name", "width", "height"}]
-                }
-            ],
-            "info": {title, author, creator, producer, ...},
-            "font_map": {"F1": {"family": str, "full_name": str, "size": float, ...}}
+            "pages": [...],
+            "info": {...},
+            "font_map": {...}
         }
     """
     empty = {
@@ -249,9 +250,16 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
     font_map: dict = {}
     font_obj_cache: dict = {}
     mediabox = [0.0, 0.0, 612.0, 792.0]
+    first_mediabox: list | None = None
+    truncated = False
 
     try:
         for page_num, page in enumerate(PDFPage.create_pages(doc), 1):
+            if max_pages is not None and page_num > max_pages:
+                truncated = True
+                break
+            if page_num == 1:
+                first_mediabox = _mediabox_list(getattr(page, "mediabox", None))
             try:
                 mediabox = _mediabox_list(getattr(page, "mediabox", None))
                 resources = getattr(page, "resources", None)
@@ -303,8 +311,9 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
         print(f"[!] Metadata page walk failed: {e}")
         return empty
 
-    width = float(mediabox[2] - mediabox[0]) if mediabox else 595.0
-    height = float(mediabox[3] - mediabox[1]) if mediabox else 842.0
+    mb = first_mediabox or mediabox
+    width = float(mb[2] - mb[0]) if mb else 595.0
+    height = float(mb[3] - mb[1]) if mb else 842.0
 
     metadata = {
         "page_count": len(pages_data),
@@ -317,6 +326,10 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None) ->
         "info": info,
         "font_map": font_map,
     }
+    if truncated:
+        # pages[] only holds the first `max_pages` entries; the real page count
+        # comes from the parser (res["pageCount"]).
+        metadata["pages_truncated"] = True
 
     _write_metadata_json(metadata, out_dir)
     return metadata
@@ -353,6 +366,29 @@ def get_page_size(metadata: dict | None) -> tuple[float, float]:
     return float(ps.get("width", 595) or 595), float(ps.get("height", 842) or 842)
 
 
+# Module-level: built and sorted ONCE (map_font_to_ttf used to rebuild and
+# re-sort this on every call — it runs once per DOCX run, thousands per file).
+_FONT_TTF_MAPPINGS = {
+    "Amyanmar": "Unicode/YoeYar-One_Bold.ttf",
+    "Arlarwade": "Unicode/Arlarwade.ttf",
+    "Gautami": "Unicode/Gautami.ttf",
+    "Zawgyi": "Unicode/YoeYar-One_Regular.ttf",
+    "YoeYar": "Unicode/YoeYar-One_Regular.ttf",
+    "Pyidaungsu": "Unicode/Pyidaungsu_Regular.ttf",
+    "Padauk": "Unicode/Padauk.ttf",
+    "Myanmar": "Unicode/MyanmarText_Regular.ttf",
+    "Times-Bold": "AnonymousPro/AnonymousPro-Bold.ttf",
+    "Times New Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
+    "Times-Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
+    "Times": "AnonymousPro/AnonymousPro-Regular.ttf",
+    "Anonymous": "AnonymousPro/AnonymousPro-Regular.ttf",
+}
+_FONT_TTF_SORTED = sorted(
+    ((k.lower(), v) for k, v in _FONT_TTF_MAPPINGS.items()),
+    key=lambda kv: -len(kv[0]),
+)
+
+
 def map_font_to_ttf(font_name: str, metadata: dict | None) -> str | None:
     """
     Map a pdfminer / parser font name to a TTF file path under fonts/.
@@ -362,26 +398,9 @@ def map_font_to_ttf(font_name: str, metadata: dict | None) -> str | None:
     fm = font_map.get(font_name, {}) if font_name else {}
     family = fm.get("family") or font_name or ""
 
-    mappings = {
-        "Amyanmar": "Unicode/YoeYar-One_Bold.ttf",
-        "Arlarwade": "Unicode/Arlarwade.ttf",
-        "Gautami": "Unicode/Gautami.ttf",
-        "Zawgyi": "Unicode/YoeYar-One_Regular.ttf",
-        "YoeYar": "Unicode/YoeYar-One_Regular.ttf",
-        "Pyidaungsu": "Unicode/Pyidaungsu_Regular.ttf",
-        "Padauk": "Unicode/Padauk.ttf",
-        "Myanmar": "Unicode/MyanmarText_Regular.ttf",
-        "Times-Bold": "AnonymousPro/AnonymousPro-Bold.ttf",
-        "Times New Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
-        "Times-Roman": "AnonymousPro/AnonymousPro-Regular.ttf",
-        "Times": "AnonymousPro/AnonymousPro-Regular.ttf",
-        "Anonymous": "AnonymousPro/AnonymousPro-Regular.ttf",
-    }
-
     family_l = family.lower()
     name_l = (font_name or "").lower()
-    for key, path in sorted(mappings.items(), key=lambda kv: -len(kv[0])):
-        kl = key.lower()
+    for kl, path in _FONT_TTF_SORTED:
         if kl in family_l or kl in name_l:
             return path
     return None

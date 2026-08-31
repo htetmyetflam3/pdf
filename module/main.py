@@ -16,6 +16,9 @@ from .unicoding import Rabbit
 from .postprocessor import postprocess, clean_imposters, reorder_marks
 from .formatter import write_output
 
+# How many leading pages pdfminer scans for page size / font names.
+_META_SCAN_PAGES = 20
+
 
 class ExtractorResult:
     """Holds the full pipeline result for inspection or API responses."""
@@ -72,13 +75,17 @@ def run_pipeline(pdf_bytes: bytes, out_path: str, pdf_name: str = "",
     -------
     ExtractorResult
     """
-    # 0. Extract metadata with pdfminer (fail-soft — parser does not need it)
+    # 0. Extract metadata with pdfminer (fail-soft — parser does not need it).
+    #    Capped scan: page size + font names come from the first pages; the
+    #    custom parser resolves everything else per page from raw objects.
+    #    A full walk of a 14k-page tree costs minutes of pdfminer resolution.
     script_dir = Path(__file__).resolve().parent
     meta_out_dir = script_dir.parent / "output"
     meta_out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        metadata = extract_pdf_metadata(pdf_bytes, out_dir=meta_out_dir)
+        metadata = extract_pdf_metadata(
+            pdf_bytes, out_dir=meta_out_dir, max_pages=_META_SCAN_PAGES)
     except Exception as e:
         print(f"[!] Metadata extraction failed ({e}); continuing without it")
         metadata = {}
@@ -131,12 +138,19 @@ def run_pipeline(pdf_bytes: bytes, out_path: str, pdf_name: str = "",
         os.makedirs(out_dir, exist_ok=True)
 
     # Merge catalog info with structural metadata the writer needs.
+    # Font map: prefer the COMPLETE union the parser gathered page-by-page
+    # (covers every chapter); the pdfminer sample (capped scan) is fallback.
     writer_meta = {}
     writer_meta.update((metadata or {}).get("info") or {})
     writer_meta.update(meta or {})
     if (metadata or {}).get("page_size"):
         writer_meta["page_size"] = metadata["page_size"]
-    if (metadata or {}).get("font_map"):
+    if res.get("page_size"):
+        writer_meta["page_size"] = res["page_size"]
+    full_font_map = res.get("font_map") or {}
+    if full_font_map:
+        writer_meta["font_map"] = full_font_map
+    elif (metadata or {}).get("font_map"):
         writer_meta["font_map"] = metadata["font_map"]
     writer_meta["page_count"] = res["pageCount"]
 
