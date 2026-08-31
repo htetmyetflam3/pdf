@@ -207,6 +207,35 @@ def _lookup_font_family(font_ref: str, metadata: dict | None) -> str:
 
 _NAME_RE = re.compile(rb"/([A-Za-z0-9_+.\-]+)")
 _NUM_RE = re.compile(rb"-?\d+(?:\.\d+)?")
+_HEX_ESCAPE_RE = re.compile(r"#([0-9A-Fa-f]{2})")
+
+
+def _unescape_name(b: bytes) -> str:
+    """Decode PDF name hex escapes: b'Times#20New#20Roman' -> 'Times New Roman'."""
+    return _HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), b.decode("latin-1"))
+
+
+def _page_resources(objects: dict, page_num: int, page_gen: int) -> bytes | None:
+    """Resolve /Resources for a page, walking /Parent while it is inherited
+    (some producers put /Resources on intermediate /Pages nodes)."""
+    n, g = page_num, page_gen
+    seen = set()
+    for _ in range(8):  # max tree depth guard
+        key = (n, g)
+        if key in seen:
+            return None
+        seen.add(key)
+        d = objects.get(key)
+        if not d:
+            return None
+        res = _resolve_indirect(objects, d, b"Resources")
+        if res:
+            return res
+        par = re.search(rb"/Parent\s+(\d+)\s+(\d+)\s+R", d)
+        if not par:
+            return None
+        n, g = int(par.group(1)), int(par.group(2))
+    return None
 
 
 def _resolve_indirect(objects: dict, d: bytes, key: bytes) -> bytes | None:
@@ -243,21 +272,21 @@ def _resolve_indirect(objects: dict, d: bytes, key: bytes) -> bytes | None:
 def resolve_page_fonts(objects: dict, page_num: int, page_gen: int) -> dict:
     """Build a font_map for one page straight from raw objects.
 
+    /Resources is followed through /Parent while inherited. Font names are
+    hex-unescaped (Times#20New#20Roman -> Times New Roman).
+
     Returns {"font_map": {...}, "mediabox": [x0,y0,x1,y1] | None}.
     """
     out = {"font_map": {}, "mediabox": None}
-    pd = objects.get((page_num, page_gen))
-    if not pd:
-        return out
 
-    resources = _resolve_indirect(objects, pd, b"Resources") or b""
+    resources = _page_resources(objects, page_num, page_gen)
     fonts = _resolve_indirect(objects, resources, b"Font") if resources else None
     if not fonts:
         return out
 
     # Iterate font entries: /F1 12 0 R  or  /F1 << ... >>
     for m in _NAME_RE.finditer(fonts):
-        name = m.group(1).decode("latin-1")
+        name = _unescape_name(m.group(1))
         after = fonts[m.end():m.end() + 96]
         ref = re.match(rb"\s+(\d+)\s+(\d+)\s+R", after)
         fobj = None
@@ -280,8 +309,8 @@ def resolve_page_fonts(objects: dict, page_num: int, page_gen: int) -> dict:
             continue
         base = re.search(rb"/BaseFont\s*/([^\s/<>\[\]()]+)", fobj)
         sub = re.search(rb"/Subtype\s*/([A-Za-z0-9]+)", fobj)
-        enc = re.search(rb"/Encoding\s*(?:/([A-Za-z0-9\-]+)|(\d+)\s+\d+\s+R)", fobj)
-        full_name = base.group(1).decode("latin-1") if base else name
+        enc = re.search(rb"/Encoding\s*(?:/([A-Za-z0-9\-]+)|(?:\d+)\s+\d+\s+R)", fobj)
+        full_name = _unescape_name(base.group(1)) if base else name
         family = full_name.split("+")[-1]
         entry = {
             "family": family,
@@ -577,11 +606,16 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
     raw_texts = []
     page_layouts = []
     doc_mediabox = None
+    doc_font_map: dict = {}   # union of every page's fonts — the writer's
+                              # global map must cover ALL chapters, not just
+                              # the pages pdfminer sampled
     for idx, (pnum, pgen) in enumerate(all_pages):
         # Per-page fonts straight from raw objects (fast, exact per page).
         raw_fonts = resolve_page_fonts(objects, pnum, pgen)
         if doc_mediabox is None:
             doc_mediabox = parse_mediabox(objects, pnum, pgen)
+        for k, v in raw_fonts["font_map"].items():
+            doc_font_map.setdefault(k, v)
         page_md = md_pages[idx] if idx < len(md_pages) else None
         local_meta = metadata
         if raw_fonts["font_map"] and metadata is not None:
@@ -638,4 +672,6 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
         "totalCharacters": sum(len(t) for t in raw_texts),
         "page_layouts": page_layouts,
         "page_size": page_size,
+        # Complete font knowledge gathered during the page walk (raw objects).
+        "font_map": doc_font_map,
     }

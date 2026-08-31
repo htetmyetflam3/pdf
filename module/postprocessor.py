@@ -25,12 +25,12 @@ _PRIORITY = {
     '\u103A': 14,  # asat
     '\u1037': 15,  # dot below
     '\u1038': 16,  # visarga
-    # NOTE: \u1039 (stacker) is intentionally NOT a reorderable mark. Per the
-    # design: it belongs to the base cluster, resets the mark-run state, and the
-    # base after it starts a fresh ordering. Sequences like kinzi
-    # '\u1004\u103A\u1039' (asat BEFORE stacker) are canonical and pass through
-    # untouched. (The original literal 'u\1039' was an octal escape that never
-    # matched anything, so the pass-through behavior was already in effect.)
+    '\u1039': 17,  # stacker — FINAL slot. It belongs to the previous base's
+                    # mark-run and closes it: the base after the stacker
+                    # starts ordering anew (index 0 / base position).
+                    # Canonical kinzi '\u1004\u103A\u1039' (asat 14 < 17) is
+                    # preserved; a stray '\u1039\u103A' normalizes to
+                    # '\u103A\u1039'.
 }
 
 # Myanmar consonant range + independent vowels

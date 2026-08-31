@@ -138,12 +138,19 @@ def run_pipeline(pdf_bytes: bytes, out_path: str, pdf_name: str = "",
         os.makedirs(out_dir, exist_ok=True)
 
     # Merge catalog info with structural metadata the writer needs.
+    # Font map: prefer the COMPLETE union the parser gathered page-by-page
+    # (covers every chapter); the pdfminer sample (capped scan) is fallback.
     writer_meta = {}
     writer_meta.update((metadata or {}).get("info") or {})
     writer_meta.update(meta or {})
     if (metadata or {}).get("page_size"):
         writer_meta["page_size"] = metadata["page_size"]
-    if (metadata or {}).get("font_map"):
+    if res.get("page_size"):
+        writer_meta["page_size"] = res["page_size"]
+    full_font_map = res.get("font_map") or {}
+    if full_font_map:
+        writer_meta["font_map"] = full_font_map
+    elif (metadata or {}).get("font_map"):
         writer_meta["font_map"] = metadata["font_map"]
     writer_meta["page_count"] = res["pageCount"]
 
