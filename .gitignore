@@ -14,13 +14,13 @@
 *output*
 *.tree*
 /frontend/
+/raw_storage/
 /module/__pycache__/
 *__pycache__/
-/raw_storage/
 /quaratine/
 /uploads/
 /frontend/
-/__pycache__/
+/
 *1.pdf*
 *.dev-note*
 *package.lock.json*
