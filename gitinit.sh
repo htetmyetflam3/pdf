@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 set -euo pipefail
 
 PROJECT_DIR="$(pwd)"
@@ -8,7 +8,7 @@ DEFAULT_REMOTE="git@github.com:htetmyetflam3/pdf.git"
 DEFAULT_USER="htetmyetflam3"
 DEFAULT_EMAIL="149076482+htetmyetflam3@users.noreply.github.com"
 DEFAULT_BRANCH="main"
-DEFAULT_SSH_KEY="${HOME}/.ssh/authkey"
+DEFAULT_SSH_KEY="${HOME}/.ssh/PDF"
 
 # ── Helpers ──
 prompt() {
