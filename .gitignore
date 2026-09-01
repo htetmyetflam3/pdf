@@ -21,7 +21,7 @@
 /quaratine/
 /uploads/
 /frontend/
-/
+*txt/
 *1.pdf*
 *.dev-note*
 *package.lock.json*
