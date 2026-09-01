@@ -39,7 +39,8 @@ Homepage = "https://github.com/htetmyetflam3/pdf"
 Issues = "https://github.com/htetmyetflam3/pdf/issues"
 
 [project.scripts]
- pdf extract= "cli:main"
+extract = "pdf_extractor.cli:main"
+
 
 [build-system]
 requires = ["hatchling"]
