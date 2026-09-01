@@ -39,7 +39,7 @@ Homepage = "https://github.com/htetmyetflam3/pdf"
 Issues = "https://github.com/htetmyetflam3/pdf/issues"
 
 [project.scripts]
-PDF extract= "cli:main"
+ pdf extract= "cli:main"
 
 [build-system]
 requires = ["hatchling"]
