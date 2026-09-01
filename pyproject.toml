@@ -35,11 +35,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourname/zawgyi-pdf-extractor"
-Issues = "https://github.com/yourname/zawgyi-pdf-extractor/issues"
+Homepage = "https://github.com/htetmyetflam3/pdf"
+Issues = "https://github.com/htetmyetflam3/pdf/issues"
 
 [project.scripts]
-zawgyi-extract = "zawgyi_pdf_extractor.cli:main"
+PDF extract= "cli:main"
 
 [build-system]
 requires = ["hatchling"]
