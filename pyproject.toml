@@ -4,15 +4,16 @@ version = "0.2.0"
 description = "Extract and normalize Burmese text from PDFs. Handles Zawgyi-encoded embedded fonts that standard extractors fail on, plus Unicode PDFs where fonts use non-standard character substitutions (e.g., ၄င်း → ၎င်း)."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 authors = [
-    {name = "Your Name", email = "you@example.com"}
+    {name = "Kaung Myat Thu"}
 ]
 keywords = ["pdf", "zawgyi", "unicode", "burmese", "myanmar", "text-extraction", "font-embedding"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: Other/Proprietary License",
+    "Private :: Do Not Upload",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
