@@ -1,6 +1,6 @@
 [project]
 name = "pdf-text-extractor"
-version = "0.1.8"
+version = "0.1.9"
 description = "Extract and normalize Burmese text from PDFs. Handles Zawgyi-encoded embedded fonts that standard extractors fail on, plus Unicode PDFs where fonts use non-standard character substitutions (e.g., ၄င်း → ၎င်း)."
 readme = "README.md"
 requires-python = ">=3.10"
