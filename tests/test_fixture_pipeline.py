@@ -142,11 +142,13 @@ class FixturePipelineTests(unittest.TestCase):
         self.assertNotIn("w:ind", self.txt)
 
     def test_character_count_is_unchanged_from_the_baseline(self):
-        # 1,217,617 before the converter was resynced with upstream Rabbit.
-        # Correct Pali stacking is one codepoint shorter than the broken form
-        # in some cases, so the count moved by 67; the page count and the
-        # layout are unaffected.
-        self.assertEqual(self.result.total_characters, 1_217_550)
+        # 1,217,617 before the converter was resynced with upstream Rabbit;
+        # correct Pali stacking is a codepoint shorter than the broken form,
+        # taking it to 1,217,550. The per-run Zawgyi guard then added 92 by
+        # NOT converting runs that were already Unicode -- conversion had
+        # been collapsing e.g. ၀င်ရောက် (asat) into ၀ငျရောကျ (medial ya).
+        # Page count and layout are unaffected either way.
+        self.assertEqual(self.result.total_characters, 1_217_642)
 
 
 if __name__ == "__main__":

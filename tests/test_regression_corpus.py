@@ -29,9 +29,11 @@ LETTER = b'<w:pgSz w:w="12240" w:h="15840"/>'
 # resynced with upstream Rabbit. Correctly stacked Pali clusters are one
 # codepoint shorter than the ASAT-joined form the drifted rules produced
 # (495 occurrences of ကမ္ဘာ alone in this file), which accounts for the
-# 226-character drop. Page count, layout and geometry are unaffected.
+# 226-character drop. The per-run Zawgyi guard then added 147 back by NOT
+# converting runs that were already Unicode, giving 3,806,796.
+# Page count, layout and geometry are unaffected by either change.
 CORPUS = {
-    "c701to1k": (6870, 3806649),
+    "c701to1k": (6870, 3806796),
     "c1-700": (14313, None),
     "c1k-end": (12664, None),
 }

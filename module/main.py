@@ -25,7 +25,8 @@ from typing import Callable
 from .prase import open_document, iter_pdf_pages, page_size_from_mediabox, extract_pdf
 from .detector import Detector
 from .unicoding import Rabbit
-from .postprocessor import postprocess, clean_imposters, reorder_marks
+from .postprocessor import (postprocess, clean_imposters, reorder_marks,
+                            looks_like_zawgyi)
 from .formatter import write_output, open_stream_writer
 
 
@@ -44,16 +45,28 @@ class ExtractorResult:
 
 
 def _apply_to_layout_page(layout: dict | None, fn) -> dict | None:
-    """Run a text transform on every line/run of one page layout."""
+    """Run a text transform on every line/run of one page layout.
+
+    When a line has runs, its text is REBUILT from the transformed runs
+    rather than transformed as one string. That matters for anything whose
+    decision depends on content: a line can mix encodings (one Zawgyi run
+    and one already-Unicode run), and transforming the joined line would
+    apply a single verdict to both halves — exactly the bug the per-run
+    Zawgyi guard exists to prevent.
+    """
     if not layout:
         return layout
     out = dict(layout)
     new_lines = []
     for line in layout.get("lines") or []:
         line2 = dict(line)
-        line2["text"] = fn(line.get("text") or "")
-        if "runs" in line:
-            line2["runs"] = [{**r, "text": fn(r.get("text") or "")} for r in line["runs"]]
+        if line.get("runs"):
+            new_runs = [{**r, "text": fn(r.get("text") or "")}
+                        for r in line["runs"]]
+            line2["runs"] = new_runs
+            line2["text"] = "".join(r["text"] for r in new_runs)
+        else:
+            line2["text"] = fn(line.get("text") or "")
         new_lines.append(line2)
     out["lines"] = new_lines
     return out
@@ -74,11 +87,42 @@ def detect_page(detector: Detector, text: str) -> tuple[str, float]:
     return detector.detect(text)
 
 
+def _convert_if_zawgyi(s: str) -> str:
+    """Convert one string, but only when it really is Zawgyi.
+
+    The page verdict is statistical and page-wide; this is the per-string
+    veto. Rabbit is not idempotent, so handing it text that is already
+    Unicode destroys that text irreversibly — see looks_like_zawgyi().
+    """
+    if not s or not looks_like_zawgyi(s):
+        return s
+    return Rabbit.zg2uni(s)
+
+
 def convert_page(text: str, layout: dict, category: str) -> tuple[str, dict]:
-    """Stage 2 (one page): Zawgyi -> Unicode, keeping layout runs in sync."""
+    """Stage 2 (one page): Zawgyi -> Unicode, keeping layout runs in sync.
+
+    RESTRUCTURED: this used to convert the whole page whenever the page
+    verdict was ZAWGYI. Pages can MIX encodings — page 6 of the fixture is
+    Zawgyi except for one already-Unicode line — and converting Unicode a
+    second time mangles it unrecoverably. Conversion is now decided per
+    string, and _apply_to_layout_page walks every line AND every run, so a
+    line that mixes encodings is handled run by run.
+    """
     if category != "ZAWGYI":
         return text, layout
-    return Rabbit.zg2uni(text), _apply_to_layout_page(layout, Rabbit.zg2uni)
+    new_layout = _apply_to_layout_page(layout, _convert_if_zawgyi)
+    # Rebuild the page text from the converted layout so the .txt and the
+    # .docx cannot disagree. Falls back to a per-LINE walk when there is no
+    # layout — never a single whole-page conversion, which would re-apply
+    # one verdict to a page that mixes encodings.
+    if new_layout and new_layout.get("lines"):
+        new_text = "\n".join(ln.get("text") or ""
+                             for ln in new_layout["lines"])
+    else:
+        new_text = "\n".join(_convert_if_zawgyi(ln)
+                             for ln in (text or "").split("\n"))
+    return new_text, new_layout
 
 
 def postprocess_page(text: str, layout: dict) -> tuple[str, dict]:
