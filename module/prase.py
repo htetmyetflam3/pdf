@@ -533,6 +533,139 @@ def parse_mediabox(objects: dict, page_num: int, page_gen: int) -> list[float] |
     return None
 
 
+_ROTATE_RE = re.compile(rb"/Rotate\s+(-?\d+)")
+_IMAGE_SUBTYPE_RE = re.compile(rb"/Subtype\s*/Image")
+
+
+def parse_rotation(objects: dict, page_num: int, page_gen: int) -> int:
+    """/Rotate for a page, normalised to 0/90/180/270.
+
+    /Rotate is an inheritable attribute, so this walks /Parent exactly the way
+    _page_resources and parse_mediabox do. Missing or unparseable means 0.
+    """
+    n, g = page_num, page_gen
+    for _ in range(8):  # max tree depth guard
+        d = objects.get((n, g))
+        if not d:
+            return 0
+        m = _ROTATE_RE.search(d)
+        if m:
+            try:
+                r = int(m.group(1)) % 360
+            except ValueError:
+                return 0
+            # Only the four right angles are legal; anything else is noise.
+            return r if r in (0, 90, 180, 270) else 0
+        par = re.search(rb"/Parent\s+(\d+)\s+(\d+)\s+R", d)
+        if not par:
+            return 0
+        n, g = int(par.group(1)), int(par.group(2))
+    return 0
+
+
+def page_has_image(objects: dict, page_num: int, page_gen: int) -> bool:
+    """True when the page's /Resources carry an image XObject.
+
+    Goes through the object store rather than scanning raw file bytes, so it
+    also sees resources that live inside an /ObjStm. The page's /Resources are
+    already resolved for fonts during the normal walk, so this is essentially
+    free.
+    """
+    res = _page_resources(objects, page_num, page_gen)
+    if not res:
+        return False
+    xobj = _resolve_indirect(objects, res, b"XObject")
+    if not xobj:
+        return False
+    if _IMAGE_SUBTYPE_RE.search(xobj):
+        return True
+    # /XObject << /Im1 12 0 R >> — the /Subtype lives in the referenced stream.
+    for m in re.finditer(rb"/[A-Za-z0-9_+.\-]+\s+(\d+)\s+(\d+)\s+R", xobj):
+        body = objects.get((int(m.group(1)), int(m.group(2))))
+        if body and _IMAGE_SUBTYPE_RE.search(body[:512]):
+            return True
+    return False
+
+
+def rotate_point(x: float, y: float, width: float, height: float,
+                 rotation: int) -> tuple[float, float]:
+    """Map a point from unrotated PDF space into the displayed page frame.
+
+    The content stream places text in unrotated space; /Rotate says how the
+    viewer turns the paper clockwise before showing it. For a page box W x H:
+
+        0   -> (x, y)           page stays W x H
+        90  -> (y, W - x)       page becomes H x W
+        180 -> (W - x, H - y)   page stays W x H
+        270 -> (H - y, x)       page becomes H x W
+
+    The returned coordinates are still bottom-left origin, y growing upward,
+    but expressed in the *displayed* page box (see rotated_page_size).
+    """
+    r = rotation % 360
+    if r == 90:
+        return y, width - x
+    if r == 180:
+        return width - x, height - y
+    if r == 270:
+        return height - y, x
+    return x, y
+
+
+def rotated_page_size(width: float, height: float,
+                      rotation: int) -> tuple[float, float]:
+    """Displayed page box for a /Rotate value: swapped only for 90 and 270."""
+    if rotation % 360 in (90, 270):
+        return height, width
+    return width, height
+
+
+def rotate_layout_lines(lines: list, width: float, height: float,
+                        rotation: int) -> list:
+    """Re-express every line of a page in the displayed frame.
+
+    Line geometry (x, y, right) and every run's x are transformed, then the
+    lines are re-sorted into true display reading order (top-to-bottom,
+    left-to-right). On a 180 degree page the unrotated order is exactly
+    reversed, so this reordering is a real correctness fix, not cosmetics.
+    """
+    rotation = rotation % 360
+    if rotation == 0 or not lines:
+        return lines
+
+    out = []
+    for ln in lines:
+        x = float(ln.get("x") or 0.0)
+        y = float(ln.get("y") or 0.0)
+        right = ln.get("right")
+        nx, ny = rotate_point(x, y, width, height, rotation)
+        new = dict(ln)
+        if right is not None:
+            # A line is a horizontal extent in unrotated space; after a 90 or
+            # 270 turn it runs vertically on the displayed page. Its length is
+            # preserved either way, so keep it as a left-to-right extent from
+            # the transformed origin rather than inventing a rotated glyph run.
+            length = float(right) - x
+            new["right"] = nx + length
+        new["x"] = nx
+        new["y"] = ny
+        runs = ln.get("runs")
+        if runs:
+            new_runs = []
+            for r in runs:
+                r2 = dict(r)
+                rx = r.get("x")
+                if rx is not None:
+                    r2["x"] = nx + (float(rx) - x)
+                new_runs.append(r2)
+            new["runs"] = new_runs
+        out.append(new)
+
+    # Reading order in the display frame.
+    out.sort(key=lambda l: (-(l.get("y") or 0.0), l.get("x") or 0.0))
+    return out
+
+
 # Myanmar cluster guards for gap detection. PDF producers split a visual line
 # into several positioned runs — sometimes INSIDE a syllable (the Zawgyi
 # e-vowel \u1031 is drawn left of its consonant, marks/medials stack around
@@ -848,8 +981,9 @@ def read_page_metadata(doc: PdfDocument, page_ref, page_md: dict = None,
     pnum, pgen = page_ref
     raw_fonts = resolve_page_fonts(doc.objects, pnum, pgen)
 
+    mediabox = parse_mediabox(doc.objects, pnum, pgen)
     if doc.mediabox is None:
-        doc.mediabox = parse_mediabox(doc.objects, pnum, pgen)
+        doc.mediabox = mediabox
     for k, v in raw_fonts["font_map"].items():
         doc.font_map.setdefault(k, v)
 
@@ -877,7 +1011,9 @@ def read_page_metadata(doc: PdfDocument, page_ref, page_md: dict = None,
 
     return {
         "font_map": raw_fonts["font_map"],
-        "mediabox": raw_fonts.get("mediabox"),
+        "mediabox": raw_fonts.get("mediabox") or mediabox,
+        "rotation": parse_rotation(doc.objects, pnum, pgen),
+        "has_image": page_has_image(doc.objects, pnum, pgen),
         "local_meta": local_meta,
     }
 
@@ -896,10 +1032,29 @@ def extract_one_page(doc: PdfDocument, page_ref, index: int,
                      page_md: dict = None, metadata: dict = None) -> dict:
     """Complete result for ONE page: metadata, text and layout."""
     pm = read_page_metadata(doc, page_ref, page_md, metadata)
-    body = read_page_text(doc, page_ref, pm["local_meta"])
-
-    layout = {"page_num": index + 1, "lines": body["lines"]}
     mb = pm["mediabox"] or (page_md or {}).get("mediabox")
+    rotation = pm.get("rotation") or 0
+    has_image = bool(pm.get("has_image"))
+
+    if has_image:
+        # Images are not supported and never will be: the page is emitted as a
+        # blank page of the right size so the output page count still matches
+        # the PDF. Its content is not read and no geometry is computed for it.
+        print(f"page {index + 1} include image skipping the page "
+              f"and leave with empty blank page")
+        body = {"text": "", "lines": []}
+    else:
+        body = read_page_text(doc, page_ref, pm["local_meta"])
+        if rotation and body["lines"] and mb:
+            # Place the text in the frame the reader actually sees, so the
+            # .txt and the .docx agree and reading order is true.
+            w = float(mb[2]) - float(mb[0])
+            h = float(mb[3]) - float(mb[1])
+            body["lines"] = rotate_layout_lines(body["lines"], w, h, rotation)
+            body["text"] = "\n".join(ln["text"] for ln in body["lines"])
+
+    layout = {"page_num": index + 1, "lines": body["lines"],
+              "rotation": rotation, "has_image": has_image}
     if mb:
         layout["mediabox"] = mb
     if page_md:

@@ -179,6 +179,9 @@ def run_pipeline(pdf_bytes: bytes, out_path: str, pdf_name: str = "",
     writer = open_stream_writer(
         out_path, pdf_name or out_path, doc, enabled=stream)
 
+    # RESTRUCTURED: these used to hold every page a second time whenever the
+    # writer was disabled. open_stream_writer() always returns a writer now —
+    # streaming is the only way a document is written — so nothing accumulates.
     buffered_texts: list[str] = []
     buffered_layouts: list[dict] = []
 
