@@ -44,3 +44,4 @@ Playground/frontend/build/assets/
 !tools/*.py
 !module/*.py
 !cli.py
+!tests/*.py

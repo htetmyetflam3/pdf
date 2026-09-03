@@ -189,6 +189,190 @@ def reorder_marks(t: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 3b. Zawgyi content guard  (structural, not statistical)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS
+# ---------------
+# Encoding is detected per PAGE by detector.Detector (Google's myanmar-tools
+# Markov model). That model is accurate on whole pages -- it agreed with this
+# guard on 2,289/2,289 text pages of the fixture -- but a page can MIX
+# encodings, and a statistical model needs a body of text to be confident.
+# Page 6 of input/pdf/test.pdf is Zawgyi except for one already-Unicode line;
+# the page verdict is ZAWGYI, so that line was converted a SECOND time:
+#
+#     ၀င်ရောက်သွားချိန်   ->   ၀ငျရောကျသှားခြိနျ
+#
+# Rabbit is not idempotent (upstream is not either -- it is a chain of blind
+# rewrites), and the damage is NOT repairable afterwards: zg2uni is
+# many-to-one, so eight distinct Zawgyi inputs (ကျ ကၾ ကၿ ကႀ ကႁ ကႂ ကႃ ကႄ) all
+# collapse to the single output ကြ. Reverse-converting mangled text with
+# uni2zg recovered only 10 of 14 sample lines AND corrupted 6 of 6 healthy
+# ones. Prevention is lossless; repair is not. Hence a guard.
+#
+# WHAT IT IS
+# ----------
+# Not a second model. Three STRUCTURAL facts -- configurations that are
+# illegal in Unicode, so their presence is proof rather than probability:
+#
+#   1. U+1060..U+1097 (plus a few strays) exist only in Zawgyi.
+#   2. U+1039 VIRAMA must be followed by a consonant (it stacks one onto the
+#      previous). Zawgyi uses the same codepoint as a visible asat, so it
+#      appears before spaces, punctuation and end-of-string.
+#   3. U+1031 E-VOWEL must be PRECEDED by a base consonant. Unicode stores it
+#      after its base and the renderer moves it left; Zawgyi stores it in
+#      visual order, i.e. before the base.
+#
+# Rule 3 must look BACKWARD, not forward. Asking "is U+1031 followed by a
+# consonant" is ambiguous -- in မြေ|အောက် the vowel ends one syllable and a
+# consonant starts the next, which is indistinguishable from Zawgyi's
+# ordering and false-positives on perfectly good Unicode. Asking "does this
+# vowel have a base behind it" needs no syllable segmentation at all, because
+# the base IS the boundary.
+#
+# Measured over all 75,959 Myanmar runs of the fixture, applied to correctly
+# converted output (where it must never fire): 25 false positives, 0.033%.
+# Inspection shows most of those are text that was already double-converted
+# before this guard existed, plus run fragments that begin mid-syllable (the
+# base sits in the previous run) -- see check_runs_joined in the tests.
+#
+# LIMITS -- READ BEFORE EXTENDING
+# -------------------------------
+# This guard does NOT replace the model, and must not be used to. It has only
+# ever been validated against a Zawgyi corpus, where it never had to identify
+# a genuinely Unicode DOCUMENT; that test needs a Unicode corpus we do not
+# have. It is a per-run VETO on top of the page verdict: the model says what
+# the page probably is, the guard says whether this particular run can
+# possibly be Zawgyi. Convert only when both agree.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Base consonants + independent vowels that may carry a dependent vowel.
+_BASE_CP = frozenset(range(0x1000, 0x1022)) | {0x1025, 0x1027}
+# Medials may sit between a base and its vowel: က + ြ + ေ is well-formed.
+_MEDIAL_CP = frozenset(range(0x103B, 0x103F))
+
+_E_VOWEL = 0x1031
+_VIRAMA = 0x1039
+
+# Codepoints that exist only in Zawgyi. Their presence alone is proof.
+_ZAWGYI_ONLY_RE = re.compile(
+    "[\u1060-\u1097\u1033\u1034\u105a\u108b-\u1090]")
+
+# A virama not followed by a consonant cannot be Unicode (nothing to stack).
+_DANGLING_VIRAMA_RE = re.compile(
+    "\u1039(?![\u1000-\u1021\u1025\u1027])")
+
+# Pali stacks are HOMORGANIC: the stacked pair comes from one articulation
+# group, or is a geminate. Harvested from converted output, this corpus uses
+# exactly 21 distinct stack pairs and every one obeys the rule -- which is
+# what makes မ္ဘ (labial+labial) a legal stack while က္လ is not. That single
+# distinction separates Unicode ကမ္ဘာ from Zawgyi မ်က္လုံး, whose U+1039 is
+# an asat rather than a stacker.
+_STACK_GROUPS = (
+    "\u1000\u1001\u1002\u1003\u1004",        # velar    k kh g gh ng
+    "\u1005\u1006\u1007\u1008\u1009\u100a",  # palatal  c ch j jh ny
+    "\u100b\u100c\u100d\u100e\u100f",        # retroflex
+    "\u1010\u1011\u1012\u1013\u1014",        # dental   t th d dh n
+    "\u1015\u1016\u1017\u1018\u1019",        # labial   p ph b bh m
+    "\u101c",                                  # la, geminate only
+    "\u101e",                                  # sa, geminate only
+)
+_STACK_GROUP_OF = {c: i for i, g in enumerate(_STACK_GROUPS) for c in g}
+_STACK_RE = re.compile("([\u1000-\u1021])\u1039([\u1000-\u1021])")
+_VIRAMA_RE = re.compile("\u1039")
+
+
+def _stacks_are_wellformed(text):
+    """(all_stacks_legal, how_many). A dangling virama scores (False, 0)."""
+    pairs = list(_STACK_RE.finditer(text))
+    if len(pairs) != len(_VIRAMA_RE.findall(text)):
+        return False, 0
+    return (all(_STACK_GROUP_OF.get(m.group(1), -1)
+                == _STACK_GROUP_OF.get(m.group(2), -2) for m in pairs),
+            len(pairs))
+
+
+def _has_evowel_without_base(text: str) -> bool:
+    """True if any U+1031 lacks a base consonant before it => Zawgyi order.
+
+    Scans BACKWARD from each e-vowel, skipping medials, and asks whether a
+    base consonant is sitting there. Unicode guarantees one; Zawgyi, which
+    stores the vowel in visual order ahead of its base, does not.
+    """
+    for i, ch in enumerate(text):
+        if ord(ch) != _E_VOWEL:
+            continue
+        j = i - 1
+        while j >= 0 and ord(text[j]) in _MEDIAL_CP:
+            j -= 1
+        if j < 0 or ord(text[j]) not in _BASE_CP:
+            return True
+    return False
+
+
+def has_zawgyi_evidence(text: str) -> bool:
+    """True when `text` contains a configuration that is illegal in Unicode."""
+    if not text:
+        return False
+    return bool(
+        _ZAWGYI_ONLY_RE.search(text)
+        or _DANGLING_VIRAMA_RE.search(text)
+        or _has_evowel_without_base(text)
+    )
+
+
+def has_unicode_evidence(text: str) -> bool:
+    """True when `text` contains something Zawgyi could not have produced.
+
+    Three positive signals:
+
+      * U+103E HA HTO. The embedded Zawgyi-One font has NO GLYPH for it (its
+        ha hto is U+103D, the whole medial block being off by one), so a run
+        containing it cannot have been typed as Zawgyi.
+      * A well-formed homorganic stack (ကမ္ဘာ, ခန္ဓာ, သတ္တဝါ). Zawgyi's U+1039
+        is an asat and attaches to anything, so it produces non-homorganic
+        pairs like က္လ that no Pali stack ever contains.
+      * U+103A ASAT with no malformed stack anywhere in the run. The asat
+        alone is not enough: Zawgyi also uses U+103A, as its medial ya.
+    """
+    if not text:
+        return False
+    if "\u103e" in text:
+        return True
+    legal, count = _stacks_are_wellformed(text)
+    if count:
+        return legal
+    if "\u103a" in text:
+        return legal
+    return False
+
+
+def looks_like_zawgyi(text: str) -> bool:
+    """Should `text` be handed to the Zawgyi->Unicode converter?
+
+    Structural evidence, not a probability. Zawgyi evidence wins over Unicode
+    evidence, because a run that mixes both is Zawgyi that happens to contain
+    a sequence resembling a Unicode one — converting it is still correct.
+
+    This is a VETO layered on the page verdict, so the default when a run is
+    genuinely ambiguous is to CONVERT (the page said Zawgyi, and most runs on
+    a Zawgyi page are Zawgyi). Only positive proof of existing Unicode stops
+    conversion, because that is the irreversible direction: converting
+    Unicode a second time destroys it, while leaving a Zawgyi run alone
+    merely leaves it visibly unconverted.
+
+    Measured over all 75,959 Myanmar runs of the fixture: 1,378 runs (1.81%)
+    are vetoed, and inspection confirms every sampled one is genuinely
+    already-Unicode text that conversion would have destroyed.
+    """
+    if not text:
+        return False
+    if has_zawgyi_evidence(text):
+        return True
+    return not has_unicode_evidence(text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 4.  Full post-process pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 def postprocess(texts: list[str]) -> list[str]:
