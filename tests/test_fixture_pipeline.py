@@ -142,7 +142,11 @@ class FixturePipelineTests(unittest.TestCase):
         self.assertNotIn("w:ind", self.txt)
 
     def test_character_count_is_unchanged_from_the_baseline(self):
-        self.assertEqual(self.result.total_characters, 1_217_617)
+        # 1,217,617 before the converter was resynced with upstream Rabbit.
+        # Correct Pali stacking is one codepoint shorter than the broken form
+        # in some cases, so the count moved by 67; the page count and the
+        # layout are unaffected.
+        self.assertEqual(self.result.total_characters, 1_217_550)
 
 
 if __name__ == "__main__":
