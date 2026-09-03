@@ -40,5 +40,7 @@ Thumbs.db
 Playground/frontend/build/assets/
 .venv/
 
-# Profiling tool ships with the repo (global *.py ignore would hide it)
+# Source ships with the repo (the global *.py ignore above would hide it)
 !tools/*.py
+!module/*.py
+!cli.py

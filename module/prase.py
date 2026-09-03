@@ -10,18 +10,20 @@ import re
 import zlib
 import struct
 
+from .pdfobjects import PdfObjectStore
 
-def parse_pdf_objects(raw: bytes) -> dict:
-    obj_pat = re.compile(rb'(\d+)\s+(\d+)\s+obj')
-    objects = {}
-    for m in obj_pat.finditer(raw):
-        n, g = int(m.group(1)), int(m.group(2))
-        start = m.end()
-        end = raw.find(b'endobj', start)
-        if end == -1:
-            continue
-        objects[(n, g)] = raw[start:end].strip()
-    return objects
+
+def parse_pdf_objects(raw: bytes) -> PdfObjectStore:
+    """Return a lazy, xref-backed object store.
+
+    RESTRUCTURED: this used to regex-scan the entire file and hold every
+    object body in a dict (~76 MB / 2.1 s on a 33 MB, 14k-page file). It now
+    reads only the trailer and the xref subsection headers; object bodies are
+    sliced on demand. The return value still behaves like the old dict
+    (`.get`, `.items()`, `in`, `[]`), so every downstream function that takes
+    `objects` keeps working unchanged.
+    """
+    return PdfObjectStore(raw)
 
 
 def get_stream(objects: dict, num: int, gen: int = 0) -> bytes | None:
@@ -46,7 +48,45 @@ def get_stream(objects: dict, num: int, gen: int = 0) -> bytes | None:
     return b
 
 
+def _decode_info_blob(info_d: str) -> dict:
+    """Pull /Key (value) pairs out of an /Info dictionary body."""
+    out = {}
+    for kv in re.finditer(r'/([^\s/\[\]<>()]+)\s*\(([^)]*)\)', info_d):
+        out[kv.group(1)] = kv.group(2)
+    for kv in re.finditer(r'/([^\s/\[\]<>()]+)\s*<([0-9A-Fa-f\s]+)>', info_d):
+        raw = re.sub(r'\s', '', kv.group(2))
+        try:
+            b = bytes.fromhex(raw)
+            if b.startswith((b'\xfe\xff', b'\xff\xfe')):
+                out[kv.group(1)] = b.decode('utf-16').strip('\ufeff')
+            else:
+                out.setdefault(kv.group(1), b.decode('latin-1', 'replace'))
+        except Exception:
+            continue
+    return out
+
+
 def extract_metadata(objects: dict) -> dict:
+    """Document /Info dictionary.
+
+    RESTRUCTURED: resolves /Info straight from the trailer (one object read)
+    instead of iterating every object looking for /Catalog. Falls back to the
+    old scan when the trailer is unusable.
+    """
+    info_ref = getattr(objects, "info_ref", lambda: None)()
+    if info_ref is not None:
+        body = objects.get((info_ref, 0))
+        if body:
+            return _decode_info_blob(body.decode('latin-1', errors='replace'))
+
+    root_ref = getattr(objects, "root_ref", lambda: None)()
+    if root_ref is not None:
+        cat = objects.get((root_ref, 0), b'').decode('latin-1', errors='replace')
+        m = re.search(r'/Info\s+(\d+)\s+\d+\s+R', cat)
+        if m:
+            body = objects.get((int(m.group(1)), 0), b'')
+            return _decode_info_blob(body.decode('latin-1', errors='replace'))
+
     metadata = {}
     for (n, g), d in objects.items():
         d_str = d.decode('latin-1', errors='replace')
@@ -55,19 +95,63 @@ def extract_metadata(objects: dict) -> dict:
             if info_m:
                 info_n = int(info_m.group(1))
                 info_d = objects.get((info_n, 0), b'').decode('latin-1', errors='replace')
-                for kv in re.finditer(r'/([^\s/\[\]<>()]+)\s*\(([^)]*)\)', info_d):
-                    metadata[kv.group(1)] = kv.group(2)
+                metadata = _decode_info_blob(info_d)
             break
     return metadata
 
 
-def find_font_file2(objects: dict) -> tuple[int, int] | None:
+def find_font_file2(objects: dict, first_page: tuple[int, int] | None = None) -> tuple[int, int] | None:
+    """Locate an embedded /FontFile2 (TrueType) stream.
+
+    RESTRUCTURED: when `first_page` is given, resolves it through that page's
+    /Resources -> /Font -> /FontDescriptor (a handful of object reads). Only
+    falls back to the whole-document scan if that finds nothing.
+    """
+    if first_page is not None:
+        hit = _font_file2_from_page(objects, first_page[0], first_page[1])
+        if hit:
+            return hit
+
     for (n, g), d in objects.items():
         d_str = d.decode('latin-1', errors='replace')
         if '/FontFile2' in d_str:
             m = re.search(r'/FontFile2\s+(\d+)\s+(\d+)\s+R', d_str)
             if m:
                 return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _font_file2_from_page(objects: dict, page_num: int, page_gen: int) -> tuple[int, int] | None:
+    """Follow one page's font resources down to a /FontFile2 stream ref."""
+    res = _page_resources(objects, page_num, page_gen)
+    if not res:
+        return None
+    fonts = _resolve_indirect(objects, res, b"Font")
+    if not fonts:
+        return None
+
+    queue: list[bytes] = []
+    for ref in re.finditer(rb"/[^\s/\[\]<>()]+\s+(\d+)\s+(\d+)\s+R", fonts):
+        body = objects.get((int(ref.group(1)), int(ref.group(2))))
+        if body:
+            queue.append(body)
+
+    seen = 0
+    while queue and seen < 64:
+        body = queue.pop(0)
+        seen += 1
+        m = re.search(rb"/FontFile2\s+(\d+)\s+(\d+)\s+R", body)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        # Descend: /DescendantFonts (Type0) then /FontDescriptor.
+        for key in (b"DescendantFonts", b"FontDescriptor"):
+            nxt = _resolve_indirect(objects, body, key)
+            if nxt:
+                queue.append(nxt)
+            for r in re.finditer(rb"/" + key + rb"\s*\[?\s*(\d+)\s+(\d+)\s+R", body):
+                nb = objects.get((int(r.group(1)), int(r.group(2))))
+                if nb:
+                    queue.append(nb)
     return None
 
 
@@ -220,6 +304,18 @@ def collect_pages(objects: dict, page_num: int, gen: int = 0) -> list:
 
 
 def find_root_pages(objects: dict) -> int | None:
+    """Object number of the page-tree root.
+
+    RESTRUCTURED: goes trailer -> /Root -> /Pages (two object reads) instead
+    of scanning every object for /Catalog. Scan kept as a fallback.
+    """
+    root_ref = getattr(objects, "root_ref", lambda: None)()
+    if root_ref is not None:
+        cat = objects.get((root_ref, 0), b'').decode('latin-1', errors='replace')
+        pm = re.search(r'/Pages\s+(\d+)\s+\d+\s+R', cat)
+        if pm:
+            return int(pm.group(1))
+
     for (n, g), d in objects.items():
         d_str = d.decode('latin-1', errors='replace')
         if re.search(r'/Type\s*/Catalog', d_str):
@@ -227,6 +323,54 @@ def find_root_pages(objects: dict) -> int | None:
             if pm:
                 return int(pm.group(1))
     return None
+
+
+def get_page_count(objects: dict, pages_obj: int | None = None) -> int:
+    """Page count from the page-tree root's /Count — no page walk.
+
+    NEW: on a flat Word-exported tree /Count is exactly len(/Kids), so this is
+    authoritative and costs one object read.
+    """
+    if pages_obj is None:
+        pages_obj = find_root_pages(objects)
+    if not pages_obj:
+        return 0
+    d = objects.get((pages_obj, 0), b'')
+    m = re.search(rb'/Count\s+(\d+)', d)
+    return int(m.group(1)) if m else 0
+
+
+def iter_page_refs(objects: dict, pages_obj: int | None = None):
+    """Yield (page_num, gen) per page, lazily, walking /Kids.
+
+    NEW: streaming counterpart to collect_pages(). collect_pages() builds the
+    whole list up front; this yields one page at a time so the caller can
+    process and release it.
+    """
+    if pages_obj is None:
+        pages_obj = find_root_pages(objects)
+    if not pages_obj:
+        return
+    stack = [(pages_obj, 0)]
+    seen = set()
+    while stack:
+        num, gen = stack.pop(0)
+        if (num, gen) in seen:
+            continue
+        seen.add((num, gen))
+        d = objects.get((num, gen), b'')
+        if not d:
+            continue
+        d_str = d.decode('latin-1', errors='replace')
+        if re.search(r'/Type\s*/Page(?!s)', d_str):
+            yield (num, gen)
+            continue
+        km = re.search(rb'/Kids\s*\[(.*?)\]', d, re.DOTALL)
+        if not km:
+            continue
+        kids_text = km.group(1).decode('latin-1', errors='replace')
+        kids = [(int(r), 0) for r in re.findall(r'(\d+)\s+\d+\s+R', kids_text)]
+        stack = kids + stack
 
 
 def _lookup_font_family(font_ref: str, metadata: dict | None) -> str:
@@ -621,29 +765,65 @@ def extract_page_text_layout(objects: dict, page_num: int, page_gen: int, gid_to
     }
 
 
-def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> dict:
-    """
-    Extract Burmese text from PDF bytes.
-    Sequential extraction, memory-flat.
-    
-    Parameters
-    ----------
-    pdf_bytes : bytes
-        Raw PDF file bytes.
-    metadata : dict | None
-        Optional metadata from pdfminer to guide extraction.
-    on_progress : callable
-        Called with {"done": int, "total": int} per page.
-    """
-    raw = pdf_bytes
+# ---------------------------------------------------------------------------
+# Linear, single-page pipeline
+#
+# RESTRUCTURED: extract_pdf() used to be one monolithic function that walked
+# every page, accumulating raw_texts[] and page_layouts[] for the whole
+# document before anything downstream ran. It is now a thin driver over small
+# functions, each doing exactly one job for exactly one page:
+#
+#   open_document()      -> once: object store + font tables + page tree
+#   read_page_metadata() -> one page: fonts + mediabox
+#   read_page_text()     -> one page: text + layout lines
+#   extract_one_page()   -> the two above, composed
+#   iter_pdf_pages()     -> generator: yields one finished page at a time
+#   extract_pdf()        -> same name/signature/return as before, built on
+#                           iter_pdf_pages() so existing callers still work
+# ---------------------------------------------------------------------------
 
-    objects = parse_pdf_objects(raw)
+
+class PdfDocument:
+    """Everything that is genuinely document-wide, resolved once."""
+
+    def __init__(self, objects, meta, gid_to_uni, uni_adv, pages_obj, page_count):
+        self.objects = objects
+        self.meta = meta
+        self.gid_to_uni = gid_to_uni
+        self.uni_adv = uni_adv
+        self.pages_obj = pages_obj
+        self.page_count = page_count
+        self.font_map: dict = {}   # grows as pages are visited
+        self.mediabox = None       # first page's box
+
+    def page_refs(self):
+        return iter_page_refs(self.objects, self.pages_obj)
+
+
+def open_document(pdf_bytes: bytes, metadata: dict = None) -> PdfDocument:
+    """Resolve the document-level context once: objects, /Info, font tables.
+
+    Reads only the trailer, the catalog, the page-tree root and the embedded
+    font program — not the page contents.
+    """
+    objects = parse_pdf_objects(pdf_bytes)
 
     meta = extract_metadata(objects)
     if metadata:
         meta.update(metadata.get("info", {}))
 
-    ff2_ref = find_font_file2(objects)
+    pages_obj = find_root_pages(objects)
+    if not pages_obj:
+        raise ValueError("No page tree found")
+
+    page_count = get_page_count(objects, pages_obj)
+
+    first_page = None
+    for ref in iter_page_refs(objects, pages_obj):
+        first_page = ref
+        break
+
+    ff2_ref = find_font_file2(objects, first_page)
     if not ff2_ref:
         raise ValueError("No embedded FontFile2 found")
 
@@ -653,89 +833,149 @@ def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> di
 
     cmap_uni_to_gid = parse_ttf_cmap(ttf)
     gid_to_uni = {gid: uni for uni, gid in cmap_uni_to_gid.items() if gid}
-    # Exact glyph advances (hmtx) — used for run widths / justification.
     try:
         uni_adv, _upem = parse_ttf_widths(ttf)
     except Exception:
         uni_adv = {}
+    del ttf, cmap_uni_to_gid
 
-    pages_obj = find_root_pages(objects)
-    if not pages_obj:
-        raise ValueError("No page tree found")
+    return PdfDocument(objects, meta, gid_to_uni, uni_adv, pages_obj, page_count)
 
-    all_pages = collect_pages(objects, pages_obj)
-    total = len(all_pages)
 
+def read_page_metadata(doc: PdfDocument, page_ref, page_md: dict = None,
+                       metadata: dict = None) -> dict:
+    """Per-page structure: font_map + mediabox, straight from raw objects."""
+    pnum, pgen = page_ref
+    raw_fonts = resolve_page_fonts(doc.objects, pnum, pgen)
+
+    if doc.mediabox is None:
+        doc.mediabox = parse_mediabox(doc.objects, pnum, pgen)
+    for k, v in raw_fonts["font_map"].items():
+        doc.font_map.setdefault(k, v)
+
+    local_meta = metadata
+    if raw_fonts["font_map"] and metadata is not None:
+        local_meta = dict(metadata)
+        local_meta["font_map"] = raw_fonts["font_map"]
+    elif page_md and metadata is not None:
+        local_map = dict(metadata.get("font_map") or {})
+        for f in page_md.get("fonts") or []:
+            ref = str(f.get("ref") or "").lstrip("/")
+            if not ref:
+                continue
+            entry = {
+                "family": f.get("family") or ref,
+                "full_name": f.get("name") or ref,
+                "size": 12,
+                "subtype": f.get("subtype"),
+                "encoding": f.get("encoding"),
+            }
+            local_map[ref] = entry
+            local_map["/" + ref] = entry
+        local_meta = dict(metadata)
+        local_meta["font_map"] = local_map
+
+    return {
+        "font_map": raw_fonts["font_map"],
+        "mediabox": raw_fonts.get("mediabox"),
+        "local_meta": local_meta,
+    }
+
+
+def read_page_text(doc: PdfDocument, page_ref, local_meta: dict = None) -> dict:
+    """Per-page text + layout lines."""
+    pnum, pgen = page_ref
+    extracted = extract_page_text_layout(
+        doc.objects, pnum, pgen, doc.gid_to_uni, local_meta, doc.uni_adv)
+    if isinstance(extracted, dict):
+        return {"text": extracted.get("text", ""), "lines": extracted.get("lines", [])}
+    return {"text": extracted or "", "lines": []}
+
+
+def extract_one_page(doc: PdfDocument, page_ref, index: int,
+                     page_md: dict = None, metadata: dict = None) -> dict:
+    """Complete result for ONE page: metadata, text and layout."""
+    pm = read_page_metadata(doc, page_ref, page_md, metadata)
+    body = read_page_text(doc, page_ref, pm["local_meta"])
+
+    layout = {"page_num": index + 1, "lines": body["lines"]}
+    mb = pm["mediabox"] or (page_md or {}).get("mediabox")
+    if mb:
+        layout["mediabox"] = mb
+    if page_md:
+        layout["fonts"] = page_md.get("fonts")
+
+    return {
+        "index": index,
+        "text": body["text"],
+        "layout": layout,
+        "font_map": pm["font_map"],
+    }
+
+
+def iter_pdf_pages(pdf_bytes: bytes, metadata: dict = None, on_progress=None,
+                   doc: PdfDocument = None):
+    """Yield one fully-processed page at a time. Nothing is accumulated here.
+
+    This is the streaming entry point: the caller decides whether to keep a
+    page or write it straight out and drop it.
+    """
+    if doc is None:
+        doc = open_document(pdf_bytes, metadata)
     md_pages = (metadata or {}).get("pages") or []
-    raw_texts = []
-    page_layouts = []
-    doc_mediabox = None
-    doc_font_map: dict = {}   # union of every page's fonts — the writer's
-                              # global map must cover ALL chapters, not just
-                              # the pages pdfminer sampled
-    for idx, (pnum, pgen) in enumerate(all_pages):
-        # Per-page fonts straight from raw objects (fast, exact per page).
-        raw_fonts = resolve_page_fonts(objects, pnum, pgen)
-        if doc_mediabox is None:
-            doc_mediabox = parse_mediabox(objects, pnum, pgen)
-        for k, v in raw_fonts["font_map"].items():
-            doc_font_map.setdefault(k, v)
+    total = doc.page_count
+
+    for idx, page_ref in enumerate(doc.page_refs()):
         page_md = md_pages[idx] if idx < len(md_pages) else None
-        local_meta = metadata
-        if raw_fonts["font_map"] and metadata is not None:
-            local_meta = dict(metadata)
-            local_meta["font_map"] = raw_fonts["font_map"]
-        elif page_md and metadata is not None:
-            # Fallback: prefer this page's /F1→family mapping over the
-            # document-wide last-write.
-            local_map = dict(metadata.get("font_map") or {})
-            for f in page_md.get("fonts") or []:
-                ref = str(f.get("ref") or "").lstrip("/")
-                if not ref:
-                    continue
-                entry = {
-                    "family": f.get("family") or ref,
-                    "full_name": f.get("name") or ref,
-                    "size": 12,
-                    "subtype": f.get("subtype"),
-                    "encoding": f.get("encoding"),
-                }
-                local_map[ref] = entry
-                local_map["/" + ref] = entry
-            local_meta = dict(metadata)
-            local_meta["font_map"] = local_map
-        extracted = extract_page_text_layout(objects, pnum, pgen, gid_to_uni, local_meta, uni_adv)
-        txt = extracted.get("text", "") if isinstance(extracted, dict) else (extracted or "")
-        lines = extracted.get("lines", []) if isinstance(extracted, dict) else []
-        raw_texts.append(txt)
-        layout = {
-            "page_num": idx + 1,
-            "lines": lines,
-        }
-        mb = raw_fonts.get("mediabox") or (page_md or {}).get("mediabox")
-        if mb:
-            layout["mediabox"] = mb
-        if page_md:
-            layout["fonts"] = page_md.get("fonts")
-        page_layouts.append(layout)
+        page = extract_one_page(doc, page_ref, idx, page_md, metadata)
+        page["total"] = total
+        yield page
         if on_progress:
             on_progress({"done": idx + 1, "total": total})
 
-    page_size = None
-    if doc_mediabox:
-        page_size = {
-            "width": doc_mediabox[2] - doc_mediabox[0],
-            "height": doc_mediabox[3] - doc_mediabox[1],
-            "unit": "pt",
-        }
+
+def page_size_from_mediabox(mediabox) -> dict | None:
+    """Convert a mediabox to the writer's page_size dict."""
+    if not mediabox:
+        return None
+    return {
+        "width": mediabox[2] - mediabox[0],
+        "height": mediabox[3] - mediabox[1],
+        "unit": "pt",
+    }
+
+
+def extract_pdf(pdf_bytes: bytes, metadata: dict = None, on_progress=None) -> dict:
+    """
+    Extract Burmese text from PDF bytes.
+
+    Same name, signature and return shape as before — now a thin linear
+    driver over iter_pdf_pages(). Use iter_pdf_pages() directly to stream
+    without holding the whole document in memory.
+
+    Parameters
+    ----------
+    pdf_bytes : bytes
+        Raw PDF file bytes.
+    metadata : dict | None
+        Optional metadata to guide extraction.
+    on_progress : callable
+        Called with {"done": int, "total": int} per page.
+    """
+    doc = open_document(pdf_bytes, metadata)
+
+    raw_texts = []
+    page_layouts = []
+    for page in iter_pdf_pages(pdf_bytes, metadata, on_progress, doc=doc):
+        raw_texts.append(page["text"])
+        page_layouts.append(page["layout"])
 
     return {
-        "metadata": meta,
+        "metadata": doc.meta,
         "pages": raw_texts,
-        "pageCount": total,
+        "pageCount": doc.page_count or len(raw_texts),
         "totalCharacters": sum(len(t) for t in raw_texts),
         "page_layouts": page_layouts,
-        "page_size": page_size,
-        # Complete font knowledge gathered during the page walk (raw objects).
-        "font_map": doc_font_map,
+        "page_size": page_size_from_mediabox(doc.mediabox),
+        "font_map": doc.font_map,
     }

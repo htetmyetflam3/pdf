@@ -17,11 +17,38 @@ import re
 from io import BytesIO
 from pathlib import Path
 
-from pdfminer.pdfparser import PDFParser
-from pdfminer.pdfdocument import PDFDocument
-from pdfminer.pdfpage import PDFPage
-from pdfminer.pdftypes import PDFObjRef, PDFStream, resolve1
-from pdfminer.psparser import PSLiteral
+# pdfminer is imported lazily. The pipeline no longer calls
+# extract_pdf_metadata() — prase.py resolves per-page fonts and mediabox from
+# raw objects — but get_page_size()/map_font_to_ttf() below are still used by
+# the formatter, and those need no pdfminer. Keeping the import lazy means the
+# package works without pdfminer installed.
+PDFParser = PDFDocument = PDFPage = None
+PDFObjRef = PDFStream = PSLiteral = None
+resolve1 = None
+
+
+def _load_pdfminer():
+    """Import pdfminer on demand; raises ImportError if it is unavailable."""
+    global PDFParser, PDFDocument, PDFPage, PDFObjRef, PDFStream, resolve1, PSLiteral
+    if PDFParser is not None:
+        return
+    from pdfminer.pdfparser import PDFParser as _P
+    from pdfminer.pdfdocument import PDFDocument as _D
+    from pdfminer.pdfpage import PDFPage as _Pg
+    from pdfminer.pdftypes import PDFObjRef as _R, PDFStream as _S, resolve1 as _r
+    from pdfminer.psparser import PSLiteral as _L
+    PDFParser, PDFDocument, PDFPage = _P, _D, _Pg
+    PDFObjRef, PDFStream, resolve1, PSLiteral = _R, _S, _r, _L
+
+
+def _safe_resolve(obj):
+    """resolve1() when pdfminer is loaded, identity otherwise."""
+    if resolve1 is None:
+        return obj
+    try:
+        return resolve1(obj)
+    except Exception:
+        return obj
 
 
 def _unescape_pdf_name(name: str) -> str:
@@ -55,12 +82,12 @@ def _decode_pdf_text(value) -> str:
 def _ps_name(obj) -> str:
     """Best-effort string from a pdfminer name / literal / bytes / ref."""
     try:
-        obj = resolve1(obj)
+        obj = _safe_resolve(obj)
     except Exception:
         pass
     if obj is None:
         return "Unknown"
-    if isinstance(obj, PSLiteral):
+    if PSLiteral is not None and isinstance(obj, PSLiteral):
         return _unescape_pdf_name(obj.name)
     if isinstance(obj, bytes):
         return _unescape_pdf_name(obj.decode("latin-1", "replace"))
@@ -70,7 +97,7 @@ def _ps_name(obj) -> str:
 def _as_dict(obj) -> dict:
     """Resolve indirect objects until we have a dict (or {})."""
     try:
-        obj = resolve1(obj)
+        obj = _safe_resolve(obj)
     except Exception:
         return {}
     return obj if isinstance(obj, dict) else {}
@@ -78,7 +105,7 @@ def _as_dict(obj) -> dict:
 
 def _as_list(obj) -> list:
     try:
-        obj = resolve1(obj)
+        obj = _safe_resolve(obj)
     except Exception:
         return []
     if obj is None:
@@ -99,11 +126,11 @@ def _to_jsonable(obj, depth: int = 0):
             return obj.decode("utf-8")
         except Exception:
             return obj.decode("latin-1", "replace")
-    if isinstance(obj, PSLiteral):
+    if PSLiteral is not None and isinstance(obj, PSLiteral):
         return obj.name
-    if isinstance(obj, PDFObjRef):
+    if PDFObjRef is not None and isinstance(obj, PDFObjRef):
         try:
-            return _to_jsonable(resolve1(obj), depth + 1)
+            return _to_jsonable(_safe_resolve(obj), depth + 1)
         except Exception:
             return f"R:{getattr(obj, 'objid', '?')}"
     if isinstance(obj, dict):
@@ -120,7 +147,7 @@ def _to_jsonable(obj, depth: int = 0):
 
 
 def _encoding_name(enc) -> str:
-    enc = resolve1(enc) if enc is not None else None
+    enc = _safe_resolve(enc) if enc is not None else None
     if enc is None:
         return "Unknown"
     if isinstance(enc, dict):
@@ -171,8 +198,8 @@ def _page_images(resources: dict) -> list[dict]:
     xobjects = _as_dict(resources.get("XObject"))
     for name, ref in xobjects.items():
         try:
-            xobj = resolve1(ref)
-            getter = xobj.get if isinstance(xobj, (dict, PDFStream)) else None
+            xobj = _safe_resolve(ref)
+            getter = xobj.get if isinstance(xobj, dict) or (PDFStream is not None and isinstance(xobj, PDFStream)) else None
             if getter is None:
                 continue
             if _ps_name(getter("Subtype")) != "Image":
@@ -226,6 +253,7 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None,
     }
 
     try:
+        _load_pdfminer()
         stream = BytesIO(pdf_bytes)
         parser = PDFParser(stream)
         doc = PDFDocument(parser)
@@ -263,7 +291,7 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None,
             try:
                 mediabox = _mediabox_list(getattr(page, "mediabox", None))
                 resources = getattr(page, "resources", None)
-                if isinstance(resources, PDFObjRef):
+                if PDFObjRef is not None and isinstance(resources, PDFObjRef):
                     resources = resolve1(resources)
                 resources = resources if isinstance(resources, dict) else {}
 
@@ -274,7 +302,7 @@ def extract_pdf_metadata(pdf_bytes: bytes, out_dir: str | Path | None = None,
                 for font_ref, font_obj in fonts.items():
                     try:
                         cache_key = None
-                        if isinstance(font_obj, PDFObjRef):
+                        if PDFObjRef is not None and isinstance(font_obj, PDFObjRef):
                             cache_key = (font_obj.objid, getattr(font_obj, "genno", 0))
                             font = font_obj_cache.get(cache_key)
                             if font is None:

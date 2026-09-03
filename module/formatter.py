@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 
 from .metadata import get_page_size, map_font_to_ttf
@@ -16,12 +17,18 @@ def _is_myanmar_text(text: str) -> bool:
     return any("\u1000" <= c <= "\u109F" or "\uAA60" <= c <= "\uAA7F" for c in (text or ""))
 
 
+# Internal plumbing keys that must not surface in the document header.
+_INTERNAL_META_KEYS = {"page_count", "page_size", "font_map"}
+
+
 def _flat_meta_items(metadata: dict):
     """Yield only scalar metadata entries for headers."""
     if not metadata:
         return
     for k, v in metadata.items():
         if isinstance(v, (dict, list, tuple)):
+            continue
+        if k in _INTERNAL_META_KEYS:
             continue
         yield k, v
 
@@ -65,101 +72,187 @@ def write_txt(all_texts, out_path, pdf_path, metadata):
 # ---------------------------------------------------------------------------
 
 def _measure_layout(metadata, page_metadata):
-    """Return the page geometry / line-pitch values used by the DOCX writers."""
+    """Return the page geometry / line-pitch values used by the DOCX writers.
+
+    Everything here is measured from the PDF itself: page box, text block
+    edges, top/bottom margins and the real baseline pitch. Nothing assumes
+    Word's 1" defaults, because these PDFs do not use them (the sample corpus
+    sits at a 56.6 pt left edge with a 49 pt baseline pitch at 20 pt type).
+    """
     width_pt, height_pt = get_page_size(metadata)
     # Word page size is in twips (1 pt = 20 twips).
     pg_w = max(1, int(round(width_pt * 20)))
     pg_h = max(1, int(round(height_pt * 20)))
 
-    # ── Layout geometry (measured, Word-style) ─────────────────────────
-    # These PDFs come from Word ("Save as PDF"), so reproduce the
-    # original document: 1" margins, the original line pitch, justified
-    # body paragraphs, centered title lines, real tabs at column gaps.
-    left_x = 72.0
-    right_x = 540.0
     page_w, page_h = width_pt, height_pt
+
+    # ── Text block edges, measured ─────────────────────────────────────
+    # Left: the modal line start (body edge), not a percentile, so a few
+    # indented lines cannot drag it. Right: a percentile of line ends,
+    # clamped inside the page box -- glyph-advance rounding makes a small
+    # tail of lines compute a `right` beyond the physical page.
+    left_x = 72.0
+    right_x = min(540.0, width_pt - 72.0)
+    body_size = 12.0
     if page_metadata:
-        xs, rr = [], []
+        xs, rr, szs = [], [], []
         for pg in page_metadata:
             for ln in (pg or {}).get("lines") or []:
+                if not (ln.get("text") or "").strip():
+                    continue
                 if ln.get("x") is not None:
-                    xs.append(ln["x"])
-                if ln.get("right"):
-                    rr.append(ln["right"])
+                    xs.append(round(float(ln["x"]), 1))
+                r = ln.get("right")
+                if r:
+                    rr.append(float(r))
+                if ln.get("size"):
+                    szs.append(round(float(ln["size"]), 1))
         if xs:
-            xs.sort()
-            left_x = xs[len(xs) // 10]   # ~10th pct: the body text edge
+            left_x = Counter(xs).most_common(1)[0][0]
+        if szs:
+            body_size = Counter(szs).most_common(1)[0][0]
         if rr:
             rr.sort()
-            right_x = rr[int(len(rr) * 0.95)]  # text right edge
+            # `right` is x plus the sum of glyph advances. For Zawgyi the
+            # stacked marks carry a nominal advance but render zero-width,
+            # so summed widths overshoot the true inked extent (measured
+            # ~11% long against the rendered page). Use the widest observed
+            # line as the column requirement rather than a percentile, and
+            # let the page box cap it: a column that is too NARROW makes
+            # Word re-wrap and destroys the PDF's line breaks, while one a
+            # little too wide changes nothing visually.
+            est = rr[-1]
+            # Leave a hairline gutter only; do not mirror the left margin,
+            # which would clip the widest lines and re-wrap them.
+            right_x = min(est, width_pt - 18.0)
+        if right_x <= left_x:
+            right_x = max(left_x + 72.0, width_pt - left_x)
 
-    margin_left = max(360, int(round(left_x * 20)))
+    margin_left = max(0, int(round(left_x * 20)))
 
     # ── Measured rhythm (per paragraph, so mixed TOC/prose pages work) ──
     body_pitch = 0.0
     wide_rights = []
     right_left_pairs = []
     if page_metadata:
-        cont_gaps = []
+        all_gaps = []
         for pg in page_metadata:
             prev_y = None
             for ln in (pg or {}).get("lines") or []:
+                if not (ln.get("text") or "").strip():
+                    continue
                 y = ln.get("y")
-                sz = ln.get("size") or 12
                 if prev_y is not None and y is not None:
                     d = prev_y - y
-                    if 0.6 * sz < d <= 2.3 * sz:
-                        cont_gaps.append(d)
+                    # Only reject nonsense (column resets, overlapping runs).
+                    # The real pitch is discovered below, not assumed to sit
+                    # under some multiple of the font size.
+                    if 0.3 < d < 0.5 * page_h:
+                        all_gaps.append(d)
                 prev_y = y
-                if ln.get("text", "").strip():
-                    r = ln.get("right") or 0
-                    w = r - (ln.get("x") or 0)
-                    right_left_pairs.append((r, w))
-                    if r:
-                        wide_rights.append(r)
-        if cont_gaps:
-            cont_gaps.sort()
-            body_pitch = cont_gaps[len(cont_gaps) // 2]
+                r = ln.get("right") or 0
+                w = r - (ln.get("x") or 0)
+                right_left_pairs.append((r, w))
+                if r:
+                    wide_rights.append(r)
+        if all_gaps:
+            # The single-spaced baseline pitch is the MODE of the gap
+            # distribution: the most repeated spacing is by definition
+            # normal line advance. Median would be skewed by paragraph
+            # breaks. Quantise to 0.5 pt so float noise clusters.
+            hist = Counter(round(g * 2) / 2 for g in all_gaps)
+            body_pitch = hist.most_common(1)[0][0]
     if body_pitch <= 0:
         body_pitch = 1.88 * 12
     pitch_tw = max(240, int(round(body_pitch * 20)))
 
+    # A gap counts as a real blank line only when it clearly exceeds the
+    # measured single-space pitch, not a font-size guess.
+    para_gap = body_pitch * 1.45
+
     justified = False
     if wide_rights:
-        wide_rights.sort()
-        # Robust right edge: median of the widest 5% of lines (ragged
-        # right text stops short of the margin; outlier runs can overshoot).
-        tail = wide_rights[-max(1, len(wide_rights) // 20):]
-        right_x = tail[len(tail) // 2]
         full_thresh = 0.55 * ((right_x - left_x) or 1)
         rights = [r for r, w in right_left_pairs if w > full_thresh]
         if len(rights) >= 10:
-            flush = sum(1 for r in rights if abs(r - right_x) <= 1.0 * 14)
+            # Flush-right within half a character = justified body text.
+            flush = sum(1 for r in rights if abs(r - right_x) <= 6.0)
             justified = flush / len(rights) > 0.55
-    else:
-        right_x = 540.0
-    # Word margins live in the 0.75"-1.5" band; clamp the estimate there.
-    margin_right = min(max(int(round((page_w - right_x) * 20)), 1080), 2160)
+
+    # Right margin follows the measured text block. Floor at 0 (not 0.75")
+    # so a wide text block is not force-narrowed, which would re-wrap every
+    # line and destroy the PDF's line breaks.
+    margin_right = max(0, int(round((page_w - right_x) * 20)))
 
     # First-line paragraph indents: lines that start after a big gap
     # (paragraph start) but sit right of the body edge by a constant.
     first_line_tw = 0
+    margin_top = 1440
+    margin_bottom = 1440
     if page_metadata:
         starts = []
+        tops, bottoms = [], []
+        spans = []
         for pg in page_metadata:
             prev_y = None
+            page_ys = []
             for ln in (pg or {}).get("lines") or []:
-                if not ln.get("text", "").strip():
+                if not (ln.get("text") or "").strip():
                     continue
                 y = ln.get("y")
-                if prev_y is not None and y is not None and (prev_y - y) > 2.3 * 14:
+                if y is not None:
+                    page_ys.append(y)
+                if prev_y is not None and y is not None and (prev_y - y) > para_gap:
                     dx = (ln.get("x") or 0) - left_x
                     if 0.25 * 14 < dx < 3 * 14:
                         starts.append(dx)
                 prev_y = y
+            if page_ys:
+                tops.append(max(page_ys))
+                bottoms.append(min(page_ys))
+                if len(page_ys) > 1:
+                    spans.append(max(page_ys) - min(page_ys))
         if len(starts) >= 8:
             starts.sort()
             first_line_tw = int(round(starts[len(starts) // 2] * 20))
+        # `y` is a BASELINE. The visual top of the text block sits one
+        # ascent above it (~0.8 em for these faces), so the page margin is
+        # measured to the glyph top, not to the baseline.
+        ascent = body_size * 0.8
+        if tops:
+            tops.sort()
+            first_baseline = tops[len(tops) // 2]
+            margin_top = max(0, int(round((page_h - first_baseline - ascent) * 20)))
+        if bottoms:
+            bottoms.sort()
+            last_baseline = bottoms[len(bottoms) // 2]
+            descent = body_size * 0.2
+            margin_bottom = max(0, int(round((last_baseline - descent) * 20)))
+
+        # The text block must actually hold the tallest page. Word breaks a
+        # page as soon as the next line does not fit, so a block even one
+        # line short cascades every page onto two and doubles the document.
+        #
+        # The requirement is the measured first-to-last BASELINE SPAN, not
+        # lines * body_pitch: a document can mix rhythms (c1-700 carries both
+        # a 49 pt and a 26.5 pt pitch), and multiplying the busiest page's
+        # line count by the single most common pitch overstates the need so
+        # badly it goes past the paper (18 x 49 = 882 pt on a 792 pt page)
+        # and pins both margins to the floor. Each page already carries its
+        # own spacing, so the span is the honest number.
+        if spans:
+            spans.sort()
+            need_pt = spans[-1] + ascent + body_size * 0.2
+            need_tw = int(round(need_pt * 20))
+            floor_tw = 288  # 0.2" -- keep the block off the paper edge
+            slack = pg_h - margin_top - margin_bottom - need_tw
+            if slack < 0:
+                take = min(max(0, margin_bottom - floor_tw), -slack)
+                margin_bottom -= take
+                slack += take
+            if slack < 0:
+                take = min(max(0, margin_top - floor_tw), -slack)
+                margin_top -= take
 
     return {
         "pg_w": pg_w,
@@ -168,6 +261,9 @@ def _measure_layout(metadata, page_metadata):
         "page_h": page_h,
         "margin_left": margin_left,
         "margin_right": margin_right,
+        "margin_top": margin_top,
+        "margin_bottom": margin_bottom,
+        "para_gap": para_gap,
         "pitch_tw": pitch_tw,
         "body_pitch": body_pitch,
         "justified": justified,
@@ -537,10 +633,13 @@ def _write_docx_manual(all_texts, out_path, pdf_path, metadata, page_metadata):
         left_x = layout["left_x"]
         body_pitch = layout["body_pitch"]
         pitch_tw = layout["pitch_tw"]
+        para_gap = layout["para_gap"]
         justified = layout["justified"]
         first_line_tw = layout["first_line_tw"]
         margin_right = layout["margin_right"]
         margin_left = layout["margin_left"]
+        margin_top = layout["margin_top"]
+        margin_bottom = layout["margin_bottom"]
         page_w = layout["page_w"]
         right_x = layout["right_x"]
 
@@ -566,16 +665,19 @@ def _write_docx_manual(all_texts, out_path, pdf_path, metadata, page_metadata):
                 for line in lines:
                     y = line.get("y")
                     size = line.get("size") or 12
-                    # Word bakes the original line spacing into baseline gaps:
-                    # up to ~2.3x font size = normal continuation; more = the
-                    # author pressed Enter extra times -> spacer paragraphs.
+                    # Baseline pitch is measured (the mode of the gap
+                    # distribution), so a gap only means "the author pressed
+                    # Enter" when it exceeds that measured pitch -- comparing
+                    # against a font-size multiple mislabels every single line
+                    # whenever the document is leaded loosely.
                     space_tw = pitch_tw
                     if prev_y is not None and y is not None:
                         d = prev_y - y  # y grows upward in PDF space
-                        if 0.6 * size < d <= 2.3 * size:
+                        if d <= para_gap:
                             space_tw = max(240, int(round(d * 20)))
-                        elif d > 2.3 * size:
-                            blank = round(d / body_pitch) - 1
+                        else:
+                            space_tw = max(240, int(round(body_pitch * 20)))
+                            blank = int(round(d / body_pitch)) - 1
                             for _ in range(max(0, min(blank, 30))):
                                 body.append(f'<w:p>{run("", _EN_FONT, size)}</w:p>')
                     prev_y = y
@@ -615,7 +717,9 @@ def _write_docx_manual(all_texts, out_path, pdf_path, metadata, page_metadata):
                f'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
                f'<w:body>{"".join(body)}'
                f'<w:sectPr><w:pgSz w:w="{pg_w}" w:h="{pg_h}"/>'
-               f'<w:pgMar w:top="1440" w:right="{margin_right}" w:bottom="1440" w:left="{margin_left}"/></w:sectPr>'
+               f'<w:pgMar w:top="{margin_top}" w:right="{margin_right}" '
+               f'w:bottom="{margin_bottom}" w:left="{margin_left}" '
+               f'w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>'
                f"</w:body></w:document>")
         zf.writestr("word/document.xml", doc)
 
@@ -655,3 +759,75 @@ def write_output(all_texts, out_path, pdf_path, metadata=None, page_metadata=Non
     else:
         raise ValueError(f"Unsupported output format: {out_ext}")
     print("[+] Done.")
+
+
+# ---------------------------------------------------------------------------
+# Streaming writers
+#
+# NEW: the writers above take the whole document at once. These accept one
+# page at a time so the pipeline never has to hold every page in memory.
+# Same output as the batch writers — they reuse the same rendering helpers.
+# ---------------------------------------------------------------------------
+
+class StreamTxtWriter:
+    """Writes TXT incrementally, one page per call."""
+
+    def __init__(self, out_path, pdf_path, page_count, metadata=None):
+        self.out_path = Path(out_path)
+        self.pdf_path = pdf_path
+        self.page_count = page_count
+        self._idx = 0
+        self._fh = open(self.out_path, "w", encoding="utf-8")
+        # /Info and the page count are known before the walk starts, so the
+        # header can go out immediately — no buffering needed.
+        self._fh.write(_build_meta_header(pdf_path, metadata or {}, page_count))
+
+    def write_page(self, text, layout=None):
+        self._idx += 1
+        self._fh.write(f"--- Page {self._idx} ---\n")
+        self._fh.write(text or "")
+        self._fh.write("\n\n")
+
+    def close(self, metadata=None):
+        self._fh.close()
+        print(f"[+] Saved TXT: {self.out_path}")
+
+
+class StreamDocxWriter:
+    """Buffers layout-light page records, then emits the DOCX on close().
+
+    python-docx builds its XML tree in memory, so a true append-per-page DOCX
+    is not possible without hand-rolling the package. This keeps only the
+    already-post-processed text/layout for each page and hands them to the
+    existing writer at the end, which is still far cheaper than the old
+    pipeline (no duplicated raw pages, no pdfminer page records).
+    """
+
+    def __init__(self, out_path, pdf_path, page_count):
+        self.out_path = out_path
+        self.pdf_path = pdf_path
+        self.page_count = page_count
+        self._texts = []
+        self._layouts = []
+
+    def write_page(self, text, layout=None):
+        self._texts.append(text)
+        self._layouts.append(layout)
+
+    def close(self, metadata=None):
+        write_docx(self._texts, self.out_path, self.pdf_path,
+                   metadata or {}, self._layouts)
+
+
+def open_stream_writer(out_path, pdf_path, doc, enabled: bool = True):
+    """Return a streaming writer for `out_path`, or None to use batch mode."""
+    if not enabled:
+        return None
+    ext = Path(out_path).suffix.lower()
+    page_count = getattr(doc, "page_count", 0)
+    doc_meta = getattr(doc, "meta", None) or {}
+    if ext == ".txt":
+        return StreamTxtWriter(out_path, pdf_path, page_count, doc_meta)
+    if ext == ".docx":
+        return StreamDocxWriter(out_path, pdf_path, page_count)
+    raise ValueError(f"Unsupported output format: {ext}")
