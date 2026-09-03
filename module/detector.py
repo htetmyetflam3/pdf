@@ -142,13 +142,16 @@ class Detector:
             return i + 1
         return 0
 
-    def _llrs(self, string: str) -> Iterator[float]:
-        """Yield log-likelihood ratios for consecutive character pairs."""
+    def _llrs(self, string: str) -> list[float]:
+        """Log-likelihood ratios for consecutive character pairs (single pass)."""
         size = self._size
-        return (
-            self._params[self._state(i) * size + self._state(j)]
-            for i, j in zip(chain((None,), string), chain(string, (None,)))
-        )
+        st = self._state
+        params = self._params
+        # states padded with 0 (foreign) at both ends — matches (None,)+s / s+(None,)
+        states = [0]
+        states.extend(st(c) for c in string)
+        states.append(0)
+        return [params[a * size + b] for a, b in zip(states, states[1:])]
 
     def get_zawgyi_probability(self, string: str) -> float:
         """
@@ -160,9 +163,10 @@ class Detector:
             0.0–1.0 probability. Values > 0.5 strongly suggest Zawgyi.
             Returns -inf if string contains only foreign characters.
         """
-        if all(map(isnan, self._llrs(string))):
+        llrs = self._llrs(string)
+        if all(map(isnan, llrs)):
             return -inf
-        total = sum(x for x in self._llrs(string) if not isnan(x))
+        total = sum(x for x in llrs if not isnan(x))
         if total >= 0:
             z = exp(-total)
             return z / (z + 1)
